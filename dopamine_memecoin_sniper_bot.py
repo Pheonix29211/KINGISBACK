@@ -1,12 +1,10 @@
 import asyncio
 import requests
-from telethon import TelegramClient
 from solana.rpc.async_api import AsyncClient
 from solders.keypair import Keypair
 from solana.transaction import Transaction
 import json
 import os
-import re
 import csv
 from datetime import datetime, timedelta
 import logging
@@ -16,16 +14,13 @@ import pandas as pd
 logging.basicConfig(filename='logs/sniper_bot.log', level=logging.INFO)
 
 # Configuration
-API_ID = os.getenv("TELEGRAM_API_ID")
-API_HASH = os.getenv("TELEGRAM_API_HASH")
 WALLET_PRIVATE_KEY = os.getenv("SOLANA_PRIVATE_KEY")
 SOLANA_RPC = os.getenv("SOLANA_RPC", "https://api.mainnet-beta.solana.com")
-DEXSCREENER_API = "https://api.dexscreener.com/latest/dex/tokens"
+DEXSCREENER_API = "https://api.dexscreener.com/latest/dex/pairs/solana"
 JUPITER_API = "https://price.jup.ag/v4/price"
 RUGCHECK_API = "https://api.rugcheck.xyz/v1/token"
 SHYFT_API = "https://api.shyft.to/sol/v1/callback/register"
 SHYFT_API_KEY = os.getenv("SHYFT_API_KEY")
-TELEGRAM_CHANNELS = ["@MustStopMurad", "@solana_trojanbot"]
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 BACKTEST_MODE = os.getenv("BACKTEST_MODE", "False") == "True"  # Convert env var to boolean
@@ -39,7 +34,6 @@ STOP_LOSS = 0.9  # 10% loss
 TRAILING_STOP = 0.98  # 2% below peak
 SLIPPAGE = 0.03  # 3% slippage
 MAX_PRICE_IMPACT = 0.05  # 5% max price impact
-HYPE_MESSAGE_THRESHOLD = 10  # Messages/hour for hype
 LOSS_STREAK_THRESHOLD = 3  # Pain after 3 losses
 MAX_TRADES_PER_DAY = 4  # 3-4 signals daily
 RAYDIUM_PROGRAM = "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8"
@@ -47,6 +41,7 @@ HEALTH_CHECK_INTERVAL = 300  # 5 minutes
 DATA_POLL_INTERVAL = 60  # 1 minute
 PRIORITY_FEE = 0.0005  # 0.0005 SOL base fee
 MIN_SOL_BALANCE = 0.15  # 0.15 SOL minimum
+MAX_TOKEN_AGE = 6 * 3600  # 6 hours in seconds
 
 # Global state
 loss_streak = 0
@@ -56,7 +51,7 @@ current_buy_amount = BUY_AMOUNT_MIN
 backtest_trades = []
 active_positions = {}  # token: buy_price
 backtest_data_cache = {}
-message_counts = {}  # token: count of messages in last hour
+processed_tokens = set()  # Track processed token addresses
 
 async def send_notification(message, is_win=True):
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
@@ -125,14 +120,20 @@ async def check_token(token_address):
         liquidity = float(data.get("pair", {}).get("liquidity", {}).get("usd", 0))
         price = float(data.get("pair", {}).get("priceUsd", 0))
         price_impact = float(data.get("pair", {}).get("priceChange", {}).get("m5", 0))
+        created_at = data.get("pair", {}).get("createdAt", None)
     else:
         market_cap = float(data.get("data", {}).get(token_address, {}).get("marketCap", 0))
         liquidity = float(data.get("data", {}).get(token_address, {}).get("liquidity", 0))
         price = float(data.get("data", {}).get(token_address, {}).get("price", 0))
         price_impact = 0
+        created_at = None
     max_cap = BASE_MAX_MARKET_CAP / (2 if loss_streak >= LOSS_STREAK_THRESHOLD else 1)
     if not (BASE_MIN_MARKET_CAP <= market_cap <= max_cap) or liquidity < 50000 or abs(price_impact) > MAX_PRICE_IMPACT:
         return None, None, None
+    if created_at:
+        created_time = datetime.fromtimestamp(created_at / 1000)
+        if (datetime.now() - created_time).total_seconds() > MAX_TOKEN_AGE:
+            return None, None, None
     if await check_rug(token_address):
         return None, None, None
     price_volatility = float(data.get("pair", {}).get("priceChange", {}).get("m5", 0)) if "dexscreener.com" in response.url else 0
@@ -140,24 +141,7 @@ async def check_token(token_address):
         return None, None, None
     return market_cap, price, liquidity
 
-async def get_hype_score(token_address, client):
-    global message_counts
-    now = datetime.now()
-    message_counts = {k: v for k, v in message_counts.items() if now - v["last_seen"] < timedelta(hours=1)}
-    count = message_counts.get(token_address, {"count": 0, "last_seen": now})["count"]
-    threshold = HYPE_MESSAGE_THRESHOLD * (2 if loss_streak >= LOSS_STREAK_THRESHOLD else 1)
-    return count >= threshold
-
-async def update_message_count(token_address):
-    global message_counts
-    now = datetime.now()
-    if token_address in message_counts:
-        message_counts[token_address]["count"] += 1
-        message_counts[token_address]["last_seen"] = now
-    else:
-        message_counts[token_address] = {"count": 1, "last_seen": now}
-
-async def execute_trade(client, token_address, buy=True, backtest=False):
+async def execute_trade(token_address, buy=True, backtest=False):
     global loss_streak, trade_count, active_positions, gain, current_buy_amount
     if backtest:
         logging.info(f"Backtest: {'Buying' if buy else 'Selling'} {token_address} with {current_buy_amount} SOL")
@@ -232,21 +216,21 @@ async def monitor_price(token_address, buy_price, market_cap, backtest=False):
         peak_price = max(peak_price, current_price)
         gain = current_price / buy_price
         if not backtest and await check_rug(token_address):
-            await execute_trade(None, token_address, buy=False, backtest=backtest)
+            await execute_trade(token_address, buy=False, backtest=backtest)
             profit = (current_price - buy_price) * current_buy_amount * 310
             await send_notification(f"😾 Rug alert on {token_address}! Sold at ${current_price} for {profit:.1f}%! Saved our bag, bae! 😿", is_win=profit > 0)
             loss_streak = loss_streak + 1 if current_price < buy_price else 0
             backtest_trades.append({"token": token_address, "profit": profit, "win": profit > 0})
             break
         if gain >= EARLY_SELL_PROFIT and (await check_rug(token_address) or current_price <= peak_price * TRAILING_STOP):
-            await execute_trade(None, token_address, buy=False, backtest=backtest)
+            await execute_trade(token_address, buy=False, backtest=backtest)
             profit = (current_price - buy_price) * current_buy_amount * 310
             await send_notification(f"😿 Early sell on {token_address} at ${current_price} for {profit:.1f}%! Dodged a dump, daddy! 💪", is_win=profit > 0)
             loss_streak = loss_streak + 1 if current_price < buy_price else 0
             backtest_trades.append({"token": token_address, "profit": profit, "win": profit > 0})
             break
         if current_price <= buy_price * STOP_LOSS:
-            await execute_trade(None, token_address, buy=False, backtest=backtest)
+            await execute_trade(token_address, buy=False, backtest=backtest)
             await send_notification(f"😡 Oof, stop loss hit for {token_address}! This SUCKS, bae! Let’s chase a MOONSHOT! 😢", is_win=False)
             loss_streak += 1
             backtest_trades.append({"token": token_address, "profit": -10 * current_buy_amount * 310, "win": False})
@@ -278,18 +262,12 @@ async def backtest():
         with open(BACKTEST_DATA, "r") as f:
             reader = csv.DictReader(f)
             tokens = sorted(set(row["token"] for row in reader), key=lambda x: x)[:100]
-        client = TelegramClient("sniper_bot", API_ID, API_HASH)
-        await client.start(bot_token=TELEGRAM_BOT_TOKEN)
-        async with client:
             for token in tokens:
                 if len([t for t in backtest_trades if t["win"]]) >= MAX_TRADES_PER_DAY and datetime.now().date() == last_trade_day:
                     break
                 market_cap, buy_price, liquidity = await check_token(token)
                 if market_cap:
-                    message_counts[token] = {"count": HYPE_MESSAGE_THRESHOLD, "last_seen": datetime.now()}
-                    if not await get_hype_score(token, client):
-                        continue
-                    await execute_trade(None, token, buy=True, backtest=True)
+                    await execute_trade(token, buy=True, backtest=True)
                     await monitor_price(token, buy_price, market_cap, backtest=True)
         df = pd.DataFrame(backtest_trades)
         win_rate = len(df[df["win"]]) / len(df) * 100 if len(df) > 0 else 0
@@ -308,40 +286,41 @@ async def health_check():
         await asyncio.sleep(HEALTH_CHECK_INTERVAL)
 
 async def main():
-    global trade_count, last_trade_day
+    global trade_count, last_trade_day, processed_tokens
     if BACKTEST_MODE:
         await backtest()
         return
     await register_shyft_callback()
     asyncio.create_task(health_check())
-    client = TelegramClient("sniper_bot", API_ID, API_HASH)
-    await client.start(bot_token=TELEGRAM_BOT_TOKEN)
-    async with client:
-        await send_notification("💃 Yo, bae, your crypto queen’s LIVE and rug-proof! Let’s stack BAGS! 🌟😘")
-        while True:
-            if trade_count >= MAX_TRADES_PER_DAY and datetime.now().date() == last_trade_day:
-                await asyncio.sleep(3600)
-                trade_count = 0
-                last_trade_day = datetime.now().date()
+    await send_notification("💃 Yo, bae, your crypto queen’s LIVE and rug-proof! Let’s stack BAGS! 🌟😘")
+    while True:
+        if trade_count >= MAX_TRADES_PER_DAY and datetime.now().date() == last_trade_day:
+            await asyncio.sleep(3600)
+            trade_count = 0
+            last_trade_day = datetime.now().date()
+            processed_tokens.clear()  # Reset processed tokens daily
+            continue
+        response = requests.get(DEXSCREENER_API)
+        if response.status_code != 200:
+            await send_notification("😿 DexScreener API down, bae! Retrying in 60s... 💔", is_win=False)
+            await asyncio.sleep(DATA_POLL_INTERVAL)
+            continue
+        data = response.json()
+        pairs = data.get("pairs", [])
+        for pair in pairs:
+            if pair.get("chainId") != "solana":
                 continue
-            for channel in TELEGRAM_CHANNELS:
-                async for message in client.iter_messages(await client.get_input_entity(channel)):
-                    if any(keyword in message.text.lower() for keyword in ["new token", "contract address", "10x", "moon"]):
-                        token_address = extract_token_address(message.text)
-                        if not token_address:
-                            continue
-                        await update_message_count(token_address)
-                        market_cap, buy_price, liquidity = await check_token(token_address)
-                        if market_cap and await get_hype_score(token_address, client):
-                            logging.info(f"Found {token_address}: ${market_cap}, hype {message_counts[token_address]['count']}")
-                            success = await execute_trade(client, token_address, buy=True)
-                            if success:
-                                asyncio.create_task(monitor_price(token_address, buy_price, market_cap))
-            await asyncio.sleep(10)
-
-def extract_token_address(text):
-    match = re.search(r"[1-9A-HJ-NP-Za-km-z]{44}", text)
-    return match.group(0) if match else None
+            token_address = pair.get("baseToken", {}).get("address")
+            if not token_address or token_address in processed_tokens:
+                continue
+            market_cap, buy_price, liquidity = await check_token(token_address)
+            if market_cap:
+                logging.info(f"Found {token_address}: ${market_cap}, liquidity ${liquidity}")
+                processed_tokens.add(token_address)
+                success = await execute_trade(token_address, buy=True)
+                if success:
+                    asyncio.create_task(monitor_price(token_address, buy_price, market_cap))
+        await asyncio.sleep(DATA_POLL_INTERVAL)
 
 if __name__ == "__main__":
     asyncio.run(main())
