@@ -12,8 +12,7 @@ import logging
 import pandas as pd
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
-import socket
-import dns.resolver
+import dns.asyncresolver
 
 # Setup logging
 logging.basicConfig(filename='logs/sniper_bot.log', level=logging.INFO)
@@ -21,9 +20,11 @@ logging.basicConfig(filename='logs/sniper_bot.log', level=logging.INFO)
 # Configuration
 WALLET_PRIVATE_KEY = os.getenv("SOLANA_PRIVATE_KEY")
 SOLANA_RPC = os.getenv("SOLANA_RPC", "https://api.mainnet-beta.solana.com")
-DEXSCREENER_API_KEY = os.getenv("DEXSCREENER_API_KEY", "")  # Optional API key
-DEXSCREENER_API = f"https://api.dexscreener.com/latest/dex/pairs/solana{'?api_key=' + DEXSCREENER_API_KEY if DEXSCREENER_API_KEY else ''}"
-JUPITER_API = "https://api.jup.ag/price/v6"
+DEXSCREENER_API_KEY = os.getenv("DEXSCREENER_API_KEY", "")  # Required API key
+DEXSCREENER_TOKEN_API = f"https://api.dexscreener.com/token-profiles/latest/v1{'?api_key=' + DEXSCREENER_API_KEY if DEXSCREENER_API_KEY else ''}"
+DEXSCREENER_PAIRS_API = f"https://api.dexscreener.com/latest/dex/pairs/solana{'?api_key=' + DEXSCREENER_API_KEY if DEXSCREENER_API_KEY else ''}"
+JUPITER_API_KEY = os.getenv("JUPITER_API_KEY", "")  # Optional API key
+JUPITER_API = f"https://api.jup.ag/price/v6{'?api_key=' + JUPITER_API_KEY if JUPITER_API_KEY else ''}"
 BIRDEYE_API = "https://public-api.birdeye.so/public/price"
 BIRDEYE_API_KEY = os.getenv("BIRDEYE_API_KEY", "")  # Optional API key
 RUGCHECK_API = "https://api.rugcheck.xyz/v1/token"
@@ -52,20 +53,23 @@ MIN_SOL_BALANCE = 0.15  # 0.15 SOL minimum
 MAX_TOKEN_AGE = 6 * 3600  # 6 hours in seconds
 PORT = int(os.getenv("PORT", 8080))  # Render port, default 8080
 
-# Custom DNS resolver for Jupiter/Birdeye
-resolver = dns.resolver.Resolver()
-resolver.nameservers = ["8.8.8.8", "8.8.4.4"]  # Google DNS
-def resolve_hostname(hostname):
-    try:
-        answers = resolver.resolve(hostname, "A")
-        return [answer.address for answer in answers]
-    except Exception as e:
-        logging.error(f"DNS resolution failed for {hostname}: {str(e)}")
-        return None
+# Async DNS resolver for Jupiter/Birdeye
+async def resolve_hostname(hostname):
+    resolver = dns.asyncresolver.Resolver()
+    resolver.nameservers = ["8.8.8.8", "8.8.4.4"]  # Google DNS
+    for attempt in range(3):
+        try:
+            answers = await resolver.resolve(hostname, "A")
+            return [str(answer) for answer in answers]
+        except Exception as e:
+            logging.error(f"DNS resolution failed for {hostname}, attempt {attempt+1}/3: {str(e)}")
+            if attempt < 2:
+                await asyncio.sleep(2 ** attempt)  # Exponential backoff: 1s, 2s
+    return None
 
 # HTTP session with retries
 session = requests.Session()
-retries = Retry(total=5, backoff_factor=1, status_forcelist=[429, 500, 502, 503, 504])
+retries = Retry(total=5, backoff_factor=2, status_forcelist=[429, 500, 502, 503, 504])
 session.mount("https://", HTTPAdapter(max_retries=retries))
 
 # Global state
@@ -148,14 +152,20 @@ async def check_rug(token_address):
 async def check_token(token_address):
     for _ in range(3):
         try:
-            response = session.get(f"{DEXSCREENER_API}/{token_address}")
+            response = session.get(f"{DEXSCREENER_PAIRS_API}/{token_address}")
             if response.status_code == 200:
                 break
             logging.error(f"DexScreener token check failed for {token_address}: Status {response.status_code} - {response.text}")
-            response = session.get(f"{JUPITER_API}?ids={token_address}")
+            jupiter_ips = await resolve_hostname("api.jup.ag")
+            if not jupiter_ips:
+                logging.error(f"DNS resolution failed for api.jup.ag")
+            response = session.get(f"{JUPITER_API}?ids={token_address}", headers={"x-api-key": JUPITER_API_KEY} if JUPITER_API_KEY else {})
             if response.status_code == 200:
                 break
             logging.error(f"Jupiter token check failed for {token_address}: Status {response.status_code} - {response.text}")
+            birdeye_ips = await resolve_hostname("public-api.birdeye.so")
+            if not birdeye_ips:
+                logging.error(f"DNS resolution failed for public-api.birdeye.so")
             response = session.get(f"{BIRDEYE_API}?address={token_address}", headers={"x-api-key": BIRDEYE_API_KEY} if BIRDEYE_API_KEY else {})
             if response.status_code == 200:
                 break
@@ -260,10 +270,16 @@ async def monitor_price(token_address, buy_price, market_cap, backtest=False):
             current_price = float(data["price"])
             market_cap = float(data["market_cap"])
         else:
-            response = session.get(f"{DEXSCREENER_API}/{token_address}")
+            response = session.get(f"{DEXSCREENER_PAIRS_API}/{token_address}")
             if response.status_code != 200:
-                response = session.get(f"{JUPITER_API}?ids={token_address}")
+                jupiter_ips = await resolve_hostname("api.jup.ag")
+                if not jupiter_ips:
+                    logging.error(f"DNS resolution failed for api.jup.ag")
+                response = session.get(f"{JUPITER_API}?ids={token_address}", headers={"x-api-key": JUPITER_API_KEY} if JUPITER_API_KEY else {})
                 if response.status_code != 200:
+                    birdeye_ips = await resolve_hostname("public-api.birdeye.so")
+                    if not birdeye_ips:
+                        logging.error(f"DNS resolution failed for public-api.birdeye.so")
                     response = session.get(f"{BIRDEYE_API}?address={token_address}", headers={"x-api-key": BIRDEYE_API_KEY} if BIRDEYE_API_KEY else {})
                     if response.status_code != 200:
                         logging.error(f"Price check failed for {token_address}: Status {response.status_code} - {response.text}")
@@ -386,59 +402,27 @@ async def main():
             continue
         for attempt in range(3):
             try:
-                response = session.get(DEXSCREENER_API)
+                response = session.get(DEXSCREENER_TOKEN_API)
                 if response.status_code == 200:
                     break
-                await send_notification(f"😿 DexScreener API failed, bae! Status {response.status_code}, attempt {attempt+1}/3 💔", is_win=False)
-                logging.error(f"DexScreener API failed: {response.status_code} - {response.text}")
+                await send_notification(f"😿 DexScreener Token API failed, bae! Status {response.status_code}, attempt {attempt+1}/3 💔", is_win=False)
+                logging.error(f"DexScreener Token API failed: {response.status_code} - {response.text}")
             except Exception as e:
-                await send_notification(f"😿 DexScreener API error, bae! {str(e)}, attempt {attempt+1}/3 💔", is_win=False)
-                logging.error(f"DexScreener API exception: {str(e)}")
+                await send_notification(f"😿 DexScreener Token API error, bae! {str(e)}, attempt {attempt+1}/3 💔", is_win=False)
+                logging.error(f"DexScreener Token API exception: {str(e)}")
             await asyncio.sleep(2 ** attempt)  # Exponential backoff: 1s, 2s, 4s
         else:
-            await send_notification("😿 DexScreener API down after retries, bae! Falling back to Jupiter... 💔", is_win=False)
-            for attempt in range(3):
-                try:
-                    # Resolve Jupiter hostname
-                    jupiter_ips = resolve_hostname("api.jup.ag")
-                    if not jupiter_ips:
-                        raise Exception("Failed to resolve api.jup.ag")
-                    response = session.get(f"{JUPITER_API}?ids={','.join(processed_tokens)}")
-                    if response.status_code == 200:
-                        break
-                    await send_notification(f"😿 Jupiter API failed, bae! Status {response.status_code}, attempt {attempt+1}/3 💔", is_win=False)
-                    logging.error(f"Jupiter API failed: {response.status_code} - {response.text}")
-                except Exception as e:
-                    await send_notification(f"😿 Jupiter API error, bae! {str(e)}, attempt {attempt+1}/3 💔", is_win=False)
-                    logging.error(f"Jupiter API exception: {str(e)}")
-                await asyncio.sleep(2 ** attempt)
+            await send_notification("😿 DexScreener Token API down after retries, bae! Falling back to pairs... 💔", is_win=False)
+            response = session.get(DEXSCREENER_PAIRS_API)
             if response.status_code != 200:
-                await send_notification("😿 Jupiter API down, bae! Falling back to Birdeye... 💔", is_win=False)
-                for attempt in range(3):
-                    try:
-                        # Resolve Birdeye hostname
-                        birdeye_ips = resolve_hostname("public-api.birdeye.so")
-                        if not birdeye_ips:
-                            raise Exception("Failed to resolve public-api.birdeye.so")
-                        response = session.get(f"{BIRDEYE_API}?address={','.join(processed_tokens)}", headers={"x-api-key": BIRDEYE_API_KEY} if BIRDEYE_API_KEY else {})
-                        if response.status_code == 200:
-                            break
-                        await send_notification(f"😿 Birdeye API failed, bae! Status {response.status_code}, attempt {attempt+1}/3 💔", is_win=False)
-                        logging.error(f"Birdeye API failed: {response.status_code} - {response.text}")
-                    except Exception as e:
-                        await send_notification(f"😿 Birdeye API error, bae! {str(e)}, attempt {attempt+1}/3 💔", is_win=False)
-                        logging.error(f"Birdeye API exception: {str(e)}")
-                    await asyncio.sleep(2 ** attempt)
-                if response.status_code != 200:
-                    await send_notification(f"😿 Birdeye API down too, bae! Retrying in {DATA_POLL_INTERVAL}s... 💔", is_win=False)
-                    await asyncio.sleep(DATA_POLL_INTERVAL)
-                    continue
-        data = response.json()
-        pairs = data.get("pairs", []) if "dexscreener.com" in response.url else data.get("data", {})
-        for pair in pairs:
-            if pair.get("chainId") != "solana" and "dexscreener.com" in response.url:
+                await send_notification(f"😿 DexScreener Pairs API failed, bae! Status {response.status_code}, attempt 1/1 💔", is_win=False)
+                logging.error(f"DexScreener Pairs API failed: {response.status_code} - {response.text}")
+                await asyncio.sleep(DATA_POLL_INTERVAL)
                 continue
-            token_address = pair.get("baseToken", {}).get("address") if "dexscreener.com" in response.url else pair.get("address")
+        data = response.json()
+        tokens = [token for token in data if token.get("chainId") == "solana"]
+        for token in tokens:
+            token_address = token.get("tokenAddress")
             if not token_address or token_address in processed_tokens:
                 continue
             market_cap, buy_price, liquidity = await check_token(token_address)
