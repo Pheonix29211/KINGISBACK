@@ -17,7 +17,8 @@ logging.basicConfig(filename='logs/sniper_bot.log', level=logging.INFO)
 # Configuration
 WALLET_PRIVATE_KEY = os.getenv("SOLANA_PRIVATE_KEY")
 SOLANA_RPC = os.getenv("SOLANA_RPC", "https://api.mainnet-beta.solana.com")
-DEXSCREENER_API = "https://api.dexscreener.com/latest/dex/pairs/solana"
+DEXSCREENER_API_KEY = os.getenv("DEXSCREENER_API_KEY", "")  # Optional API key
+DEXSCREENER_API = f"https://api.dexscreener.com/latest/dex/pairs/solana{'?api_key=' + DEXSCREENER_API_KEY if DEXSCREENER_API_KEY else ''}"
 JUPITER_API = "https://price.jup.ag/v4/price"
 RUGCHECK_API = "https://api.rugcheck.xyz/v1/token"
 SHYFT_API = "https://api.shyft.to/sol/v1/callback/register"
@@ -39,7 +40,7 @@ LOSS_STREAK_THRESHOLD = 3  # Pain after 3 losses
 MAX_TRADES_PER_DAY = 4  # 3-4 signals daily
 RAYDIUM_PROGRAM = "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8"
 HEALTH_CHECK_INTERVAL = 300  # 5 minutes
-DATA_POLL_INTERVAL = 60  # 1 minute
+DATA_POLL_INTERVAL = 10  # 10 seconds for faster memecoin sniping
 PRIORITY_FEE = 0.0005  # 0.0005 SOL base fee
 MIN_SOL_BALANCE = 0.15  # 0.15 SOL minimum
 MAX_TOKEN_AGE = 6 * 3600  # 6 hours in seconds
@@ -81,13 +82,20 @@ async def register_shyft_callback():
         "addresses": [RAYDIUM_PROGRAM],
         "callback_url": os.getenv("CALLBACK_URL")
     }
-    for _ in range(3):
-        response = requests.post(SHYFT_API, json=payload, headers=headers)
-        if response.status_code == 200:
-            await send_notification("💃 Shyft callback locked in, bae! Rug-proof AF! 😘")
-            return
-        await asyncio.sleep(1)
-    await send_notification("😿 Shyft callback failed, daddy! Check API key! 💔", is_win=False)
+    for attempt in range(3):
+        try:
+            response = requests.post(SHYFT_API, json=payload, headers=headers)
+            if response.status_code == 200:
+                await send_notification("💃 Shyft callback locked in, bae! Rug-proof AF! 😘")
+                return
+            else:
+                await send_notification(f"😿 Shyft callback failed, daddy! Status {response.status_code}, attempt {attempt+1}/3 💔", is_win=False)
+                logging.error(f"Shyft callback failed: {response.status_code} - {response.text}")
+        except Exception as e:
+            await send_notification(f"😿 Shyft callback error, daddy! {str(e)}, attempt {attempt+1}/3 💔", is_win=False)
+            logging.error(f"Shyft callback exception: {str(e)}")
+        await asyncio.sleep(2 ** attempt)  # Exponential backoff: 1s, 2s, 4s
+    await send_notification("😿 Shyft callback failed after retries, daddy! Check API key and CALLBACK_URL! 💔", is_win=False)
 
 async def check_rug(token_address):
     rug_response = requests.get(f"{RUGCHECK_API}/{token_address}")
@@ -115,6 +123,7 @@ async def check_token(token_address):
             break
         await asyncio.sleep(1)
     if response.status_code != 200:
+        logging.error(f"Token check failed for {token_address}: Status {response.status_code} - {response.text}")
         return None, None, None
     data = response.json()
     if "dexscreener.com" in response.url:
@@ -187,6 +196,7 @@ async def execute_trade(token_address, buy=True, backtest=False):
                 return True
             except Exception as e:
                 await send_notification(f"😿 Trade error, bae! {str(e)} Retrying... 💔", is_win=False)
+                logging.error(f"Trade error for {token_address}: {str(e)}")
                 await asyncio.sleep(1)
         await send_notification(f"😿 Trade failed after retries, bae! Check SOLANA_RPC or balance! 💔", is_win=False)
         return False
@@ -207,6 +217,7 @@ async def monitor_price(token_address, buy_price, market_cap, backtest=False):
             if response.status_code != 200:
                 response = requests.get(f"{JUPITER_API}?tokens={token_address}")
                 if response.status_code != 200:
+                    logging.error(f"Price check failed for {token_address}: Status {response.status_code} - {response.text}")
                     break
                 data = response.json()
                 current_price = float(data.get("data", {}).get(token_address, {}).get("price", 0))
@@ -302,6 +313,7 @@ async def start_server():
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", PORT)
     await site.start()
+    logging.info(f"HTTP server running on port {PORT}")
 
 async def main():
     global trade_count, last_trade_day, processed_tokens
@@ -319,13 +331,36 @@ async def main():
             last_trade_day = datetime.now().date()
             processed_tokens.clear()  # Reset processed tokens daily
             continue
-        response = requests.get(DEXSCREENER_API)
-        if response.status_code != 200:
-            await send_notification("😿 DexScreener API down, bae! Retrying in 60s... 💔", is_win=False)
-            await asyncio.sleep(DATA_POLL_INTERVAL)
-            continue
+        for attempt in range(3):
+            try:
+                response = requests.get(DEXSCREENER_API)
+                if response.status_code == 200:
+                    break
+                await send_notification(f"😿 DexScreener API failed, bae! Status {response.status_code}, attempt {attempt+1}/3 💔", is_win=False)
+                logging.error(f"DexScreener API failed: {response.status_code} - {response.text}")
+            except Exception as e:
+                await send_notification(f"😿 DexScreener API error, bae! {str(e)}, attempt {attempt+1}/3 💔", is_win=False)
+                logging.error(f"DexScreener API exception: {str(e)}")
+            await asyncio.sleep(2 ** attempt)  # Exponential backoff: 1s, 2s, 4s
+        else:
+            await send_notification("😿 DexScreener API down after retries, bae! Falling back to Jupiter... 💔", is_win=False)
+            for attempt in range(3):
+                try:
+                    response = requests.get(JUPITER_API)
+                    if response.status_code == 200:
+                        break
+                    await send_notification(f"😿 Jupiter API failed, bae! Status {response.status_code}, attempt {attempt+1}/3 💔", is_win=False)
+                    logging.error(f"Jupiter API failed: {response.status_code} - {response.text}")
+                except Exception as e:
+                    await send_notification(f"😿 Jupiter API error, bae! {str(e)}, attempt {attempt+1}/3 💔", is_win=False)
+                    logging.error(f"Jupiter API exception: {str(e)}")
+                await asyncio.sleep(2 ** attempt)
+            if response.status_code != 200:
+                await send_notification(f"😿 Jupiter API down too, bae! Retrying in {DATA_POLL_INTERVAL}s... 💔", is_win=False)
+                await asyncio.sleep(DATA_POLL_INTERVAL)
+                continue
         data = response.json()
-        pairs = data.get("pairs", [])
+        pairs = data.get("pairs", []) if "dexscreener.com" in response.url else data.get("data", {})
         for pair in pairs:
             if pair.get("chainId") != "solana":
                 continue
