@@ -28,6 +28,7 @@ SHYFT_API_KEY = os.getenv("SHYFT_API_KEY")
 TELEGRAM_CHANNELS = ["@MustStopMurad", "@solana_trojanbot"]
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+BACKTEST_MODE = os.getenv("BACKTEST_MODE", "False") == "True"  # Convert env var to boolean
 BASE_MIN_MARKET_CAP = 10000  # $10k
 BASE_MAX_MARKET_CAP = 200000  # $200k
 BUY_AMOUNT_MIN = 0.048387  # ~$15 at $310/SOL
