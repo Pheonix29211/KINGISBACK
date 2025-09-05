@@ -64,12 +64,12 @@ async def resolve_hostname(hostname):
         except Exception as e:
             logging.error(f"DNS resolution failed for {hostname}, attempt {attempt+1}/3: {str(e)}")
             if attempt < 2:
-                await asyncio.sleep(2 ** attempt)  # Exponential backoff: 1s, 2s
+                await asyncio.sleep(3 ** attempt)  # Exponential backoff: 3s, 9s
     return None
 
 # HTTP session with retries
 session = requests.Session()
-retries = Retry(total=5, backoff_factor=2, status_forcelist=[429, 500, 502, 503, 504])
+retries = Retry(total=5, backoff_factor=3, status_forcelist=[429, 500, 502, 503, 504])
 session.mount("https://", HTTPAdapter(max_retries=retries))
 
 # Global state
@@ -124,7 +124,7 @@ async def register_shyft_callback():
         except Exception as e:
             await send_notification(f"😿 Shyft callback error, daddy! {str(e)}, attempt {attempt+1}/3 💔", is_win=False)
             logging.error(f"Shyft callback exception: {str(e)}")
-        await asyncio.sleep(2 ** attempt)  # Exponential backoff: 1s, 2s, 4s
+        await asyncio.sleep(3 ** attempt)  # Exponential backoff: 3s, 9s
     await send_notification("😿 Shyft callback failed after retries, daddy! Check API key and CALLBACK_URL! 💔", is_win=False)
 
 async def check_rug(token_address):
@@ -150,6 +150,7 @@ async def check_rug(token_address):
     return False
 
 async def check_token(token_address):
+    data = None
     for _ in range(3):
         try:
             response = session.get(f"{DEXSCREENER_PAIRS_API}/{token_address}")
@@ -157,7 +158,7 @@ async def check_token(token_address):
                 try:
                     data = response.json()
                     if data is None or not isinstance(data, dict) or "pair" not in data:
-                        logging.error(f"DexScreener token check failed for {token_address}: Invalid JSON response")
+                        logging.error(f"DexScreener token check failed for {token_address}: Invalid JSON response - {response.text}")
                         continue
                     break
                 except json.JSONDecodeError as e:
@@ -171,8 +172,8 @@ async def check_token(token_address):
             if response.status_code == 200:
                 try:
                     data = response.json()
-                    if data is None or not isinstance(data, dict) or "data" not in data:
-                        logging.error(f"Jupiter token check failed for {token_address}: Invalid JSON response")
+                    if data is None or not isinstance(data, dict) or "data" not in data or token_address not in data.get("data", {}):
+                        logging.error(f"Jupiter token check failed for {token_address}: Invalid JSON response - {response.text}")
                         continue
                     break
                 except json.JSONDecodeError as e:
@@ -186,8 +187,8 @@ async def check_token(token_address):
             if response.status_code == 200:
                 try:
                     data = response.json()
-                    if data is None or not isinstance(data, dict) or "data" not in data:
-                        logging.error(f"Birdeye token check failed for {token_address}: Invalid JSON response")
+                    if data is None or not isinstance(data, dict) or "data" not in data or "value" not in data.get("data", {}):
+                        logging.error(f"Birdeye token check failed for {token_address}: Invalid JSON response - {response.text}")
                         continue
                     break
                 except json.JSONDecodeError as e:
@@ -197,11 +198,8 @@ async def check_token(token_address):
         except Exception as e:
             logging.error(f"Token check error for {token_address}: {str(e)}")
         await asyncio.sleep(3)  # Increased delay for retries
-    else:
-        logging.error(f"Token check failed for {token_address}: All APIs failed after retries")
-        return None, None, None
     if data is None or not isinstance(data, dict):
-        logging.error(f"Token check failed for {token_address}: No valid response data")
+        logging.error(f"Token check failed for {token_address}: No valid response data after retries")
         return None, None, None
     if "dexscreener.com" in response.url:
         market_cap = float(data.get("pair", {}).get("marketCap", 0))
@@ -317,22 +315,28 @@ async def monitor_price(token_address, buy_price, market_cap, backtest=False):
                 try:
                     data = response.json()
                     if data is None or not isinstance(data, dict):
-                        logging.error(f"Price check failed for {token_address}: Invalid JSON response")
+                        logging.error(f"Price check failed for {token_address}: Invalid JSON response - {response.text}")
                         break
                 except json.JSONDecodeError as e:
                     logging.error(f"Price check failed for {token_address}: JSON decode error - {str(e)}")
                     break
                 if "jup.ag" in response.url:
+                    if token_address not in data.get("data", {}):
+                        logging.error(f"Price check failed for {token_address}: Token not found in Jupiter response")
+                        break
                     current_price = float(data.get("data", {}).get(token_address, {}).get("price", 0))
                     market_cap = float(data.get("data", {}).get(token_address, {}).get("marketCap", 0))
                 else:  # Birdeye
+                    if "value" not in data.get("data", {}):
+                        logging.error(f"Price check failed for {token_address}: Invalid Birdeye response - {response.text}")
+                        break
                     current_price = float(data.get("data", {}).get("value", 0))
                     market_cap = float(data.get("data", {}).get("mc", 0))
             else:
                 try:
                     data = response.json()
                     if data is None or not isinstance(data, dict) or "pair" not in data:
-                        logging.error(f"Price check failed for {token_address}: Invalid JSON response")
+                        logging.error(f"Price check failed for {token_address}: Invalid JSON response - {response.text}")
                         break
                 except json.JSONDecodeError as e:
                     logging.error(f"Price check failed for {token_address}: JSON decode error - {str(e)}")
@@ -462,7 +466,7 @@ async def main():
             except Exception as e:
                 await send_notification(f"😿 DexScreener Token API error, bae! {str(e)}, attempt {attempt+1}/3 💔", is_win=False)
                 logging.error(f"DexScreener Token API exception: {str(e)}")
-            await asyncio.sleep(2 ** attempt)  # Exponential backoff: 1s, 2s, 4s
+            await asyncio.sleep(3 ** attempt)  # Exponential backoff: 3s, 9s
         else:
             await send_notification("😿 DexScreener Token API down after retries, bae! Falling back to pairs... 💔", is_win=False)
             for attempt in range(3):
@@ -483,7 +487,7 @@ async def main():
                 except Exception as e:
                     await send_notification(f"😿 DexScreener Pairs API error, bae! {str(e)}, attempt {attempt+1}/3 💔", is_win=False)
                     logging.error(f"DexScreener Pairs API exception: {str(e)}")
-                await asyncio.sleep(2 ** attempt)
+                await asyncio.sleep(3 ** attempt)
             if response.status_code != 200:
                 await send_notification(f"😿 DexScreener Pairs API down too, bae! Retrying in {DATA_POLL_INTERVAL}s... 💔", is_win=False)
                 await asyncio.sleep(DATA_POLL_INTERVAL)
@@ -495,25 +499,30 @@ async def main():
             if not token_address or token_address in processed_tokens:
                 continue
             # Validate token_address with pairs endpoint
-            try:
-                pair_response = session.get(f"{DEXSCREENER_PAIRS_API}/{token_address}")
-                if pair_response.status_code != 200:
+            for attempt in range(3):
+                try:
+                    pair_response = session.get(f"{DEXSCREENER_PAIRS_API}/{token_address}")
+                    if pair_response.status_code == 200:
+                        try:
+                            pair_data = pair_response.json()
+                            if pair_data is None or not isinstance(pair_data, dict) or "pair" not in pair_data:
+                                logging.error(f"Invalid pair data for {token_address}: {pair_response.text}")
+                                break
+                        except json.JSONDecodeError as e:
+                            logging.error(f"Invalid pair JSON for {token_address}: {str(e)}")
+                            break
+                        market_cap, buy_price, liquidity = await check_token(token_address)
+                        if market_cap:
+                            logging.info(f"Found {token_address}: ${market_cap}, liquidity ${liquidity}")
+                            processed_tokens.add(token_address)
+                            success = await execute_trade(token_address, buy=True)
+                            if success:
+                                asyncio.create_task(monitor_price(token_address, buy_price, market_cap))
+                        break
                     logging.error(f"Invalid token address {token_address}: Status {pair_response.status_code} - {pair_response.text}")
-                    continue
-                pair_data = pair_response.json()
-                if pair_data is None or not isinstance(pair_data, dict) or "pair" not in pair_data:
-                    logging.error(f"Invalid pair data for {token_address}: {pair_response.text}")
-                    continue
-            except Exception as e:
-                logging.error(f"Token validation error for {token_address}: {str(e)}")
-                continue
-            market_cap, buy_price, liquidity = await check_token(token_address)
-            if market_cap:
-                logging.info(f"Found {token_address}: ${market_cap}, liquidity ${liquidity}")
-                processed_tokens.add(token_address)
-                success = await execute_trade(token_address, buy=True)
-                if success:
-                    asyncio.create_task(monitor_price(token_address, buy_price, market_cap))
+                except Exception as e:
+                    logging.error(f"Token validation error for {token_address}: {str(e)}")
+                await asyncio.sleep(3 ** attempt)  # Exponential backoff: 3s, 9s
         await asyncio.sleep(DATA_POLL_INTERVAL)
 
 if __name__ == "__main__":
