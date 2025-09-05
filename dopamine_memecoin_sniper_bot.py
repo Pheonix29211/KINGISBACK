@@ -7,7 +7,6 @@ from solana.transaction import Transaction
 import json
 import os
 import re
-import winsound
 import csv
 from datetime import datetime, timedelta
 import logging
@@ -66,7 +65,6 @@ async def send_notification(message, is_win=True):
         if response.status_code == 200:
             break
         await asyncio.sleep(1)
-    winsound.Beep(2000 if is_win and "JACKPOT" in message else 1000 if is_win else 400, 1000 if is_win else 500)
     logging.info(f"{datetime.now()}: {message}")
 
 async def check_wallet_balance(sol_client):
