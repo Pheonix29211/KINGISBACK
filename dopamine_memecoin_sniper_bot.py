@@ -278,7 +278,7 @@ async def backtest():
         with open(BACKTEST_DATA, "r") as f:
             reader = csv.DictReader(f)
             tokens = sorted(set(row["token"] for row in reader), key=lambda x: x)[:100]
-        async with TelegramClient("sniper_bot", API_ID, API_HASH, bot_token=TELEGRAM_BOT_TOKEN) as client:
+        async with TelegramClient("sniper_bot", API_ID, API_HASH) as client:
             for token in tokens:
                 if len([t for t in backtest_trades if t["win"]]) >= MAX_TRADES_PER_DAY and datetime.now().date() == last_trade_day:
                     break
@@ -312,7 +312,7 @@ async def main():
         return
     await register_shyft_callback()
     asyncio.create_task(health_check())
-    async with TelegramClient("sniper_bot", API_ID, API_HASH, bot_token=TELEGRAM_BOT_TOKEN) as client:
+    async with TelegramClient("sniper_bot", API_ID, API_HASH) as client:
         await send_notification("💃 Yo, bae, your crypto queen’s LIVE and rug-proof! Let’s stack BAGS! 🌟😘")
         while True:
             if trade_count >= MAX_TRADES_PER_DAY and datetime.now().date() == last_trade_day:
