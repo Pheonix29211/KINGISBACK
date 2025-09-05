@@ -154,6 +154,10 @@ async def check_token(token_address):
         try:
             response = session.get(f"{DEXSCREENER_PAIRS_API}/{token_address}")
             if response.status_code == 200:
+                data = response.json()
+                if data is None or "pair" not in data:
+                    logging.error(f"DexScreener token check failed for {token_address}: Invalid response data")
+                    continue
                 break
             logging.error(f"DexScreener token check failed for {token_address}: Status {response.status_code} - {response.text}")
             jupiter_ips = await resolve_hostname("api.jup.ag")
@@ -161,6 +165,10 @@ async def check_token(token_address):
                 logging.error(f"DNS resolution failed for api.jup.ag")
             response = session.get(f"{JUPITER_API}?ids={token_address}", headers={"x-api-key": JUPITER_API_KEY} if JUPITER_API_KEY else {})
             if response.status_code == 200:
+                data = response.json()
+                if data is None or "data" not in data:
+                    logging.error(f"Jupiter token check failed for {token_address}: Invalid response data")
+                    continue
                 break
             logging.error(f"Jupiter token check failed for {token_address}: Status {response.status_code} - {response.text}")
             birdeye_ips = await resolve_hostname("public-api.birdeye.so")
@@ -168,15 +176,21 @@ async def check_token(token_address):
                 logging.error(f"DNS resolution failed for public-api.birdeye.so")
             response = session.get(f"{BIRDEYE_API}?address={token_address}", headers={"x-api-key": BIRDEYE_API_KEY} if BIRDEYE_API_KEY else {})
             if response.status_code == 200:
+                data = response.json()
+                if data is None or "data" not in data:
+                    logging.error(f"Birdeye token check failed for {token_address}: Invalid response data")
+                    continue
                 break
             logging.error(f"Birdeye token check failed for {token_address}: Status {response.status_code} - {response.text}")
         except Exception as e:
             logging.error(f"Token check error for {token_address}: {str(e)}")
-        await asyncio.sleep(1)
-    if response.status_code != 200:
-        logging.error(f"Token check failed for {token_address}: Status {response.status_code} - {response.text}")
+        await asyncio.sleep(2)  # Increased delay for retries
+    else:
+        logging.error(f"Token check failed for {token_address}: All APIs failed")
         return None, None, None
-    data = response.json()
+    if data is None:
+        logging.error(f"Token check failed for {token_address}: No valid response data")
+        return None, None, None
     if "dexscreener.com" in response.url:
         market_cap = float(data.get("pair", {}).get("marketCap", 0))
         liquidity = float(data.get("pair", {}).get("liquidity", {}).get("usd", 0))
@@ -285,6 +299,9 @@ async def monitor_price(token_address, buy_price, market_cap, backtest=False):
                         logging.error(f"Price check failed for {token_address}: Status {response.status_code} - {response.text}")
                         break
                 data = response.json()
+                if data is None:
+                    logging.error(f"Price check failed for {token_address}: No response data")
+                    break
                 if "jup.ag" in response.url:
                     current_price = float(data.get("data", {}).get(token_address, {}).get("price", 0))
                     market_cap = float(data.get("data", {}).get(token_address, {}).get("marketCap", 0))
@@ -293,6 +310,9 @@ async def monitor_price(token_address, buy_price, market_cap, backtest=False):
                     market_cap = float(data.get("data", {}).get("mc", 0))
             else:
                 data = response.json()
+                if data is None or "pair" not in data:
+                    logging.error(f"Price check failed for {token_address}: Invalid response data")
+                    break
                 current_price = float(data.get("pair", {}).get("priceUsd", 0))
                 market_cap = float(data.get("pair", {}).get("marketCap", 0))
         peak_price = max(peak_price, current_price)
@@ -424,6 +444,15 @@ async def main():
         for token in tokens:
             token_address = token.get("tokenAddress")
             if not token_address or token_address in processed_tokens:
+                continue
+            # Validate token_address with pairs endpoint
+            try:
+                pair_response = session.get(f"{DEXSCREENER_PAIRS_API}/{token_address}")
+                if pair_response.status_code != 200:
+                    logging.error(f"Invalid token address {token_address}: Status {pair_response.status_code} - {pair_response.text}")
+                    continue
+            except Exception as e:
+                logging.error(f"Token validation error for {token_address}: {str(e)}")
                 continue
             market_cap, buy_price, liquidity = await check_token(token_address)
             if market_cap:
