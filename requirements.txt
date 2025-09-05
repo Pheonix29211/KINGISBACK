@@ -1,0 +1,6 @@
+requests==2.31.0
+telethon==1.36.0
+solders==0.21.0
+solana==0.34.3
+pandas==2.2.2
+websockets==12.0
