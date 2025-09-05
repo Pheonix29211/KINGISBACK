@@ -324,18 +324,19 @@ async def main():
                 trade_count = 0
                 last_trade_day = datetime.now().date()
                 continue
-            async for message in client.iter_messages(TELEGRAM_CHANNELS):
-                if any(keyword in message.text.lower() for keyword in ["new token", "contract address", "10x", "moon"]):
-                    token_address = extract_token_address(message.text)
-                    if not token_address:
-                        continue
-                    await update_message_count(token_address)
-                    market_cap, buy_price, liquidity = await check_token(token_address)
-                    if market_cap and await get_hype_score(token_address, client):
-                        logging.info(f"Found {token_address}: ${market_cap}, hype {message_counts[token_address]['count']}")
-                        success = await execute_trade(client, token_address, buy=True)
-                        if success:
-                            asyncio.create_task(monitor_price(token_address, buy_price, market_cap))
+            for channel in TELEGRAM_CHANNELS:
+                async for message in client.iter_messages(await client.get_input_entity(channel)):
+                    if any(keyword in message.text.lower() for keyword in ["new token", "contract address", "10x", "moon"]):
+                        token_address = extract_token_address(message.text)
+                        if not token_address:
+                            continue
+                        await update_message_count(token_address)
+                        market_cap, buy_price, liquidity = await check_token(token_address)
+                        if market_cap and await get_hype_score(token_address, client):
+                            logging.info(f"Found {token_address}: ${market_cap}, hype {message_counts[token_address]['count']}")
+                            success = await execute_trade(client, token_address, buy=True)
+                            if success:
+                                asyncio.create_task(monitor_price(token_address, buy_price, market_cap))
             await asyncio.sleep(10)
 
 def extract_token_address(text):
