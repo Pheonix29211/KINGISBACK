@@ -3,6 +3,7 @@ import requests
 from solana.rpc.async_api import AsyncClient
 from solders.keypair import Keypair
 from solana.transaction import Transaction
+from aiohttp import web
 import json
 import os
 import csv
@@ -42,6 +43,7 @@ DATA_POLL_INTERVAL = 60  # 1 minute
 PRIORITY_FEE = 0.0005  # 0.0005 SOL base fee
 MIN_SOL_BALANCE = 0.15  # 0.15 SOL minimum
 MAX_TOKEN_AGE = 6 * 3600  # 6 hours in seconds
+PORT = int(os.getenv("PORT", 8080))  # Render port, default 8080
 
 # Global state
 loss_streak = 0
@@ -285,6 +287,22 @@ async def health_check():
         await send_notification("💖 Yo, bae, I’m still alive and hunting MOONSHOTS! 😘")
         await asyncio.sleep(HEALTH_CHECK_INTERVAL)
 
+async def handle_callback(request):
+    data = await request.json()
+    logging.info(f"Shyft callback received: {data}")
+    return web.Response(text="OK")
+
+async def handle_health(request):
+    return web.Response(text="Bot is running")
+
+async def start_server():
+    app = web.Application()
+    app.add_routes([web.get("/", handle_health), web.post("/callback", handle_callback)])
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", PORT)
+    await site.start()
+
 async def main():
     global trade_count, last_trade_day, processed_tokens
     if BACKTEST_MODE:
@@ -292,6 +310,7 @@ async def main():
         return
     await register_shyft_callback()
     asyncio.create_task(health_check())
+    asyncio.create_task(start_server())
     await send_notification("💃 Yo, bae, your crypto queen’s LIVE and rug-proof! Let’s stack BAGS! 🌟😘")
     while True:
         if trade_count >= MAX_TRADES_PER_DAY and datetime.now().date() == last_trade_day:
