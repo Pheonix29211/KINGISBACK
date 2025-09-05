@@ -10,6 +10,10 @@ import csv
 from datetime import datetime, timedelta
 import logging
 import pandas as pd
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+import socket
+import dns.resolver
 
 # Setup logging
 logging.basicConfig(filename='logs/sniper_bot.log', level=logging.INFO)
@@ -19,7 +23,9 @@ WALLET_PRIVATE_KEY = os.getenv("SOLANA_PRIVATE_KEY")
 SOLANA_RPC = os.getenv("SOLANA_RPC", "https://api.mainnet-beta.solana.com")
 DEXSCREENER_API_KEY = os.getenv("DEXSCREENER_API_KEY", "")  # Optional API key
 DEXSCREENER_API = f"https://api.dexscreener.com/latest/dex/pairs/solana{'?api_key=' + DEXSCREENER_API_KEY if DEXSCREENER_API_KEY else ''}"
-JUPITER_API = "https://price.jup.ag/v4/price"
+JUPITER_API = "https://api.jup.ag/price/v6"
+BIRDEYE_API = "https://public-api.birdeye.so/public/price"
+BIRDEYE_API_KEY = os.getenv("BIRDEYE_API_KEY", "")  # Optional API key
 RUGCHECK_API = "https://api.rugcheck.xyz/v1/token"
 SHYFT_API = "https://api.shyft.to/sol/v1/callback/register"
 SHYFT_API_KEY = os.getenv("SHYFT_API_KEY")
@@ -46,6 +52,22 @@ MIN_SOL_BALANCE = 0.15  # 0.15 SOL minimum
 MAX_TOKEN_AGE = 6 * 3600  # 6 hours in seconds
 PORT = int(os.getenv("PORT", 8080))  # Render port, default 8080
 
+# Custom DNS resolver for Jupiter/Birdeye
+resolver = dns.resolver.Resolver()
+resolver.nameservers = ["8.8.8.8", "8.8.4.4"]  # Google DNS
+def resolve_hostname(hostname):
+    try:
+        answers = resolver.resolve(hostname, "A")
+        return [answer.address for answer in answers]
+    except Exception as e:
+        logging.error(f"DNS resolution failed for {hostname}: {str(e)}")
+        return None
+
+# HTTP session with retries
+session = requests.Session()
+retries = Retry(total=5, backoff_factor=1, status_forcelist=[429, 500, 502, 503, 504])
+session.mount("https://", HTTPAdapter(max_retries=retries))
+
 # Global state
 loss_streak = 0
 trade_count = 0
@@ -60,9 +82,13 @@ async def send_notification(message, is_win=True):
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message}
     for _ in range(3):
-        response = requests.post(url, json=payload)
-        if response.status_code == 200:
-            break
+        try:
+            response = session.post(url, json=payload)
+            if response.status_code == 200:
+                break
+            logging.error(f"Telegram notification failed: {response.status_code} - {response.text}")
+        except Exception as e:
+            logging.error(f"Telegram notification error: {str(e)}")
         await asyncio.sleep(1)
     logging.info(f"{datetime.now()}: {message}")
 
@@ -84,7 +110,7 @@ async def register_shyft_callback():
     }
     for attempt in range(3):
         try:
-            response = requests.post(SHYFT_API, json=payload, headers=headers)
+            response = session.post(SHYFT_API, json=payload, headers=headers)
             if response.status_code == 200:
                 await send_notification("💃 Shyft callback locked in, bae! Rug-proof AF! 😘")
                 return
@@ -98,29 +124,44 @@ async def register_shyft_callback():
     await send_notification("😿 Shyft callback failed after retries, daddy! Check API key and CALLBACK_URL! 💔", is_win=False)
 
 async def check_rug(token_address):
-    rug_response = requests.get(f"{RUGCHECK_API}/{token_address}")
-    if rug_response.status_code == 200:
-        rug_data = rug_response.json()
-        if rug_data.get("risk_level") == "danger" or rug_data.get("top_holder_percentage", 0) > 75:
-            return True
-    shyft_response = requests.get(f"https://api.shyft.to/sol/v1/events?network=mainnet-beta&address={token_address}", headers={"x-api-key": SHYFT_API_KEY})
-    if shyft_response.status_code == 200:
-        events = shyft_response.json().get("events", [])
-        for event in events:
-            if event.get("type") in ["LIQUIDITY_WITHDRAWAL", "TOKEN_BURN"] and event.get("amount") > 8000:
+    try:
+        rug_response = session.get(f"{RUGCHECK_API}/{token_address}")
+        if rug_response.status_code == 200:
+            rug_data = rug_response.json()
+            if rug_data.get("risk_level") == "danger" or rug_data.get("top_holder_percentage", 0) > 75:
                 return True
-            if event.get("type") == "TRANSFER" and event.get("from") == event.get("programId") and event.get("amount") > 800000:
-                return True
+    except Exception as e:
+        logging.error(f"Rugcheck API error for {token_address}: {str(e)}")
+    try:
+        shyft_response = session.get(f"https://api.shyft.to/sol/v1/events?network=mainnet-beta&address={token_address}", headers={"x-api-key": SHYFT_API_KEY})
+        if shyft_response.status_code == 200:
+            events = shyft_response.json().get("events", [])
+            for event in events:
+                if event.get("type") in ["LIQUIDITY_WITHDRAWAL", "TOKEN_BURN"] and event.get("amount") > 8000:
+                    return True
+                if event.get("type") == "TRANSFER" and event.get("from") == event.get("programId") and event.get("amount") > 800000:
+                    return True
+    except Exception as e:
+        logging.error(f"Shyft rug check error for {token_address}: {str(e)}")
     return False
 
 async def check_token(token_address):
     for _ in range(3):
-        response = requests.get(f"{DEXSCREENER_API}/{token_address}")
-        if response.status_code == 200:
-            break
-        response = requests.get(f"{JUPITER_API}?tokens={token_address}")
-        if response.status_code == 200:
-            break
+        try:
+            response = session.get(f"{DEXSCREENER_API}/{token_address}")
+            if response.status_code == 200:
+                break
+            logging.error(f"DexScreener token check failed for {token_address}: Status {response.status_code} - {response.text}")
+            response = session.get(f"{JUPITER_API}?ids={token_address}")
+            if response.status_code == 200:
+                break
+            logging.error(f"Jupiter token check failed for {token_address}: Status {response.status_code} - {response.text}")
+            response = session.get(f"{BIRDEYE_API}?address={token_address}", headers={"x-api-key": BIRDEYE_API_KEY} if BIRDEYE_API_KEY else {})
+            if response.status_code == 200:
+                break
+            logging.error(f"Birdeye token check failed for {token_address}: Status {response.status_code} - {response.text}")
+        except Exception as e:
+            logging.error(f"Token check error for {token_address}: {str(e)}")
         await asyncio.sleep(1)
     if response.status_code != 200:
         logging.error(f"Token check failed for {token_address}: Status {response.status_code} - {response.text}")
@@ -132,11 +173,17 @@ async def check_token(token_address):
         price = float(data.get("pair", {}).get("priceUsd", 0))
         price_impact = float(data.get("pair", {}).get("priceChange", {}).get("m5", 0))
         created_at = data.get("pair", {}).get("createdAt", None)
-    else:
+    elif "jup.ag" in response.url:
         market_cap = float(data.get("data", {}).get(token_address, {}).get("marketCap", 0))
         liquidity = float(data.get("data", {}).get(token_address, {}).get("liquidity", 0))
         price = float(data.get("data", {}).get(token_address, {}).get("price", 0))
         price_impact = 0
+        created_at = None
+    else:  # Birdeye
+        market_cap = float(data.get("data", {}).get("mc", 0))
+        liquidity = float(data.get("data", {}).get("liquidity", 0))
+        price = float(data.get("data", {}).get("value", 0))
+        price_impact = float(data.get("data", {}).get("priceChange5m", 0)) / 100
         created_at = None
     max_cap = BASE_MAX_MARKET_CAP / (2 if loss_streak >= LOSS_STREAK_THRESHOLD else 1)
     if not (BASE_MIN_MARKET_CAP <= market_cap <= max_cap) or liquidity < 50000 or abs(price_impact) > MAX_PRICE_IMPACT:
@@ -213,15 +260,21 @@ async def monitor_price(token_address, buy_price, market_cap, backtest=False):
             current_price = float(data["price"])
             market_cap = float(data["market_cap"])
         else:
-            response = requests.get(f"{DEXSCREENER_API}/{token_address}")
+            response = session.get(f"{DEXSCREENER_API}/{token_address}")
             if response.status_code != 200:
-                response = requests.get(f"{JUPITER_API}?tokens={token_address}")
+                response = session.get(f"{JUPITER_API}?ids={token_address}")
                 if response.status_code != 200:
-                    logging.error(f"Price check failed for {token_address}: Status {response.status_code} - {response.text}")
-                    break
+                    response = session.get(f"{BIRDEYE_API}?address={token_address}", headers={"x-api-key": BIRDEYE_API_KEY} if BIRDEYE_API_KEY else {})
+                    if response.status_code != 200:
+                        logging.error(f"Price check failed for {token_address}: Status {response.status_code} - {response.text}")
+                        break
                 data = response.json()
-                current_price = float(data.get("data", {}).get(token_address, {}).get("price", 0))
-                market_cap = float(data.get("data", {}).get(token_address, {}).get("marketCap", 0))
+                if "jup.ag" in response.url:
+                    current_price = float(data.get("data", {}).get(token_address, {}).get("price", 0))
+                    market_cap = float(data.get("data", {}).get(token_address, {}).get("marketCap", 0))
+                else:  # Birdeye
+                    current_price = float(data.get("data", {}).get("value", 0))
+                    market_cap = float(data.get("data", {}).get("mc", 0))
             else:
                 data = response.json()
                 current_price = float(data.get("pair", {}).get("priceUsd", 0))
@@ -333,7 +386,7 @@ async def main():
             continue
         for attempt in range(3):
             try:
-                response = requests.get(DEXSCREENER_API)
+                response = session.get(DEXSCREENER_API)
                 if response.status_code == 200:
                     break
                 await send_notification(f"😿 DexScreener API failed, bae! Status {response.status_code}, attempt {attempt+1}/3 💔", is_win=False)
@@ -346,7 +399,11 @@ async def main():
             await send_notification("😿 DexScreener API down after retries, bae! Falling back to Jupiter... 💔", is_win=False)
             for attempt in range(3):
                 try:
-                    response = requests.get(JUPITER_API)
+                    # Resolve Jupiter hostname
+                    jupiter_ips = resolve_hostname("api.jup.ag")
+                    if not jupiter_ips:
+                        raise Exception("Failed to resolve api.jup.ag")
+                    response = session.get(f"{JUPITER_API}?ids={','.join(processed_tokens)}")
                     if response.status_code == 200:
                         break
                     await send_notification(f"😿 Jupiter API failed, bae! Status {response.status_code}, attempt {attempt+1}/3 💔", is_win=False)
@@ -356,15 +413,32 @@ async def main():
                     logging.error(f"Jupiter API exception: {str(e)}")
                 await asyncio.sleep(2 ** attempt)
             if response.status_code != 200:
-                await send_notification(f"😿 Jupiter API down too, bae! Retrying in {DATA_POLL_INTERVAL}s... 💔", is_win=False)
-                await asyncio.sleep(DATA_POLL_INTERVAL)
-                continue
+                await send_notification("😿 Jupiter API down, bae! Falling back to Birdeye... 💔", is_win=False)
+                for attempt in range(3):
+                    try:
+                        # Resolve Birdeye hostname
+                        birdeye_ips = resolve_hostname("public-api.birdeye.so")
+                        if not birdeye_ips:
+                            raise Exception("Failed to resolve public-api.birdeye.so")
+                        response = session.get(f"{BIRDEYE_API}?address={','.join(processed_tokens)}", headers={"x-api-key": BIRDEYE_API_KEY} if BIRDEYE_API_KEY else {})
+                        if response.status_code == 200:
+                            break
+                        await send_notification(f"😿 Birdeye API failed, bae! Status {response.status_code}, attempt {attempt+1}/3 💔", is_win=False)
+                        logging.error(f"Birdeye API failed: {response.status_code} - {response.text}")
+                    except Exception as e:
+                        await send_notification(f"😿 Birdeye API error, bae! {str(e)}, attempt {attempt+1}/3 💔", is_win=False)
+                        logging.error(f"Birdeye API exception: {str(e)}")
+                    await asyncio.sleep(2 ** attempt)
+                if response.status_code != 200:
+                    await send_notification(f"😿 Birdeye API down too, bae! Retrying in {DATA_POLL_INTERVAL}s... 💔", is_win=False)
+                    await asyncio.sleep(DATA_POLL_INTERVAL)
+                    continue
         data = response.json()
         pairs = data.get("pairs", []) if "dexscreener.com" in response.url else data.get("data", {})
         for pair in pairs:
-            if pair.get("chainId") != "solana":
+            if pair.get("chainId") != "solana" and "dexscreener.com" in response.url:
                 continue
-            token_address = pair.get("baseToken", {}).get("address")
+            token_address = pair.get("baseToken", {}).get("address") if "dexscreener.com" in response.url else pair.get("address")
             if not token_address or token_address in processed_tokens:
                 continue
             market_cap, buy_price, liquidity = await check_token(token_address)
