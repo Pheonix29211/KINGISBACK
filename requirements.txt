@@ -1,6 +1,8 @@
+```
 requests==2.31.0
 solders==0.21.0
 solana==0.34.3
 pandas==2.2.2
 aiohttp==3.10.10
 python-telegram-bot==21.5
+```
