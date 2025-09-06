@@ -14,7 +14,6 @@ import logging
 import pandas as pd
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
-import dns.asyncresolver
 
 # Setup logging
 logging.basicConfig(filename='logs/sniper_bot.log', level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -22,13 +21,8 @@ logging.basicConfig(filename='logs/sniper_bot.log', level=logging.INFO, format='
 # Configuration
 WALLET_PRIVATE_KEY = os.getenv("SOLANA_PRIVATE_KEY")
 SOLANA_RPC = os.getenv("SOLANA_RPC", "https://api.mainnet-beta.solana.com")
-DEXSCREENER_API_KEY = os.getenv("DEXSCREENER_API_KEY", "")  # Required API key
-DEXSCREENER_TOKEN_API = f"https://api.dexscreener.com/token-profiles/latest/v1{'?api_key=' + DEXSCREENER_API_KEY if DEXSCREENER_API_KEY else ''}"
-DEXSCREENER_PAIRS_API = f"https://api.dexscreener.com/latest/dex/pairs/solana{'?api_key=' + DEXSCREENER_API_KEY if DEXSCREENER_API_KEY else ''}"
-JUPITER_API_KEY = os.getenv("JUPITER_API_KEY", "")  # Required API key
-JUPITER_API = f"https://api.jup.ag/price/v6{'?api_key=' + JUPITER_API_KEY if JUPITER_API_KEY else ''}"
-BIRDEYE_API = "https://public-api.birdeye.so/public/price"
-BIRDEYE_API_KEY = os.getenv("BIRDEYE_API_KEY", "")  # Optional API key
+DEXSCREENER_TOKEN_API = "https://api.dexscreener.com/token-profiles/latest/v1"
+DEXSCREENER_PAIRS_API = "https://api.dexscreener.com/latest/dex/pairs/solana"
 RUGCHECK_API = "https://api.rugcheck.xyz/v1/token"
 SHYFT_API = "https://api.shyft.to/sol/v1/callback/register"
 SHYFT_API_KEY = os.getenv("SHYFT_API_KEY")
@@ -54,6 +48,22 @@ PRIORITY_FEE = 0.0005  # 0.0005 SOL base fee
 MIN_SOL_BALANCE = 0.15  # 0.15 SOL minimum
 MAX_TOKEN_AGE = 6 * 3600  # 6 hours in seconds
 PORT = int(os.getenv("PORT", 8080))  # Render port, default 8080
+
+# Fallback token engine (from your document)
+FALLBACK_TOKENS = [
+    "3trQxYokXbnxFThN2ppaCBqrodu9zyPPviaQf75MBAGS",
+    "XbYpCajESGmRVor733e7e1uT9NLxdWxZMdXV3L4bonk",
+    "4nig1DDAzUw9s2DYfDhhY3eXkSYwssdGr5mX5FRWJJ7D",
+    "yRcSaCyujTwnAA2mdZXB3ykJ9UjPjWKH6EAu15apump",
+    "9qitnJLcrwxYN6xb5n9jYBsQAFfLKqnzwGRvHa7Wpump",
+    "H47nC6VBFBPvDApUyyfrEHhhQVL72NsbtjQYK99EBAGS",
+    "FNf1uFhgJX6c6A6eQWaNdrMcVmK1PNuz69jWYo3HHHqJ",
+    "Ad5iUfBi37m9ygp7YG4DT3q8FVro2ipx9inehUXrD4GS",
+    "H3kviw9zovZLbv3hu1tXf7rZjqrT6UemKXia8HdBpump",
+    "6odHwsHzgW3PKSR8hZtwmbKZNJW3eXwyBcLzwNxnBAGS",
+    "BJDELgLq9sV2eKyT3L3iUWq6cPScpYk7dgey7uHx7PLd",
+    "ARXgGGivfg28FaReZQLZF5HJ7yRPMCmzfYtvznfvpump"
+]
 
 # HTTP session with retries
 session = requests.Session()
@@ -93,12 +103,12 @@ async def check_wallet_balance(sol_client):
         balance = await sol_client.get_balance(keypair.pubkey())
         sol_balance = balance.value / 1_000_000_000  # Lamports to SOL
         if sol_balance < MIN_SOL_BALANCE:
-            await send_notification(f"😿 Low balance, bae! Only {sol_balance:.4f} SOL left, need {MIN_SOL_BALANCE} SOL! 💔")
+            await send_notification(f"😿 Low balance! Only {sol_balance:.4f} SOL left, need {MIN_SOL_BALANCE} SOL! 💔")
             return False
         return True
     except Exception as e:
         logging.error(f"Wallet balance check failed: {str(e)}")
-        await send_notification(f"😿 Wallet balance check failed, bae! {str(e)} 💔")
+        await send_notification(f"😿 Wallet balance check failed! {str(e)} 💔")
         return False
 
 async def register_shyft_callback():
@@ -160,9 +170,6 @@ async def check_token(token_address):
     response_url = None
     for _ in range(3):
         try:
-            if not DEXSCREENER_API_KEY:
-                logging.error(f"DEXSCREENER_API_KEY missing, skipping DexScreener check for {token_address}")
-                break
             response = session.get(f"{DEXSCREENER_PAIRS_API}/{token_address}")
             if response.status_code == 200:
                 try:
@@ -178,48 +185,6 @@ async def check_token(token_address):
                     data = None
                     continue
             logging.error(f"DexScreener token check failed for {token_address}: Status {response.status_code} - {response.text}")
-            if not JUPITER_API_KEY:
-                logging.error(f"JUPITER_API_KEY missing, skipping Jupiter check for {token_address}")
-                continue
-            jupiter_ips = await resolve_hostname("api.jup.ag")
-            if not jupiter_ips:
-                logging.error(f"DNS resolution failed for api.jup.ag")
-            response = session.get(f"{JUPITER_API}?ids={token_address}", headers={"x-api-key": JUPITER_API_KEY})
-            if response.status_code == 200:
-                try:
-                    data = response.json()
-                    if data is None or not isinstance(data, dict) or "data" not in data or token_address not in data.get("data", {}):
-                        logging.error(f"Jupiter token check failed for {token_address}: Invalid JSON response - {response.text}")
-                        data = None
-                        continue
-                    response_url = response.url
-                    break
-                except json.JSONDecodeError as e:
-                    logging.error(f"Jupiter token check failed for {token_address}: JSON decode error - {str(e)}")
-                    data = None
-                    continue
-            logging.error(f"Jupiter token check failed for {token_address}: Status {response.status_code} - {response.text}")
-            if not BIRDEYE_API_KEY:
-                logging.error(f"BIRDEYE_API_KEY missing, skipping Birdeye check for {token_address}")
-                continue
-            birdeye_ips = await resolve_hostname("public-api.birdeye.so")
-            if not birdeye_ips:
-                logging.error(f"DNS resolution failed for public-api.birdeye.so")
-            response = session.get(f"{BIRDEYE_API}?address={token_address}", headers={"x-api-key": BIRDEYE_API_KEY})
-            if response.status_code == 200:
-                try:
-                    data = response.json()
-                    if data is None or not isinstance(data, dict) or "data" not in data or "value" not in data.get("data", {}):
-                        logging.error(f"Birdeye token check failed for {token_address}: Invalid JSON response - {response.text}")
-                        data = None
-                        continue
-                    response_url = response.url
-                    break
-                except json.JSONDecodeError as e:
-                    logging.error(f"Birdeye token check failed for {token_address}: JSON decode error - {str(e)}")
-                    data = None
-                    continue
-            logging.error(f"Birdeye token check failed for {token_address}: Status {response.status_code} - {response.text}")
         except Exception as e:
             logging.error(f"Token check error for {token_address}: {str(e)}")
         await asyncio.sleep(3)
@@ -227,24 +192,11 @@ async def check_token(token_address):
         logging.error(f"Token check failed for {token_address}: No valid response data after retries")
         return None, None, None
     try:
-        if response_url and "dexscreener.com" in response_url:
-            market_cap = float(data.get("pair", {}).get("marketCap", 0))
-            liquidity = float(data.get("pair", {}).get("liquidity", {}).get("usd", 0))
-            price = float(data.get("pair", {}).get("priceUsd", 0))
-            price_impact = float(data.get("pair", {}).get("priceChange", {}).get("m5", 0))
-            created_at = data.get("pair", {}).get("createdAt", None)
-        elif response_url and "jup.ag" in response_url:
-            market_cap = float(data.get("data", {}).get(token_address, {}).get("marketCap", 0))
-            liquidity = float(data.get("data", {}).get(token_address, {}).get("liquidity", 0))
-            price = float(data.get("data", {}).get(token_address, {}).get("price", 0))
-            price_impact = 0
-            created_at = None
-        else:  # Birdeye
-            market_cap = float(data.get("data", {}).get("mc", 0))
-            liquidity = float(data.get("data", {}).get("liquidity", 0))
-            price = float(data.get("data", {}).get("value", 0))
-            price_impact = float(data.get("data", {}).get("priceChange5m", 0)) / 100
-            created_at = None
+        market_cap = float(data.get("pair", {}).get("marketCap", 0))
+        liquidity = float(data.get("pair", {}).get("liquidity", {}).get("usd", 0))
+        price = float(data.get("pair", {}).get("priceUsd", 0))
+        price_impact = float(data.get("pair", {}).get("priceChange", {}).get("m5", 0))
+        created_at = data.get("pair", {}).get("createdAt", None)
     except (ValueError, TypeError) as e:
         logging.error(f"Data parsing error for {token_address}: {str(e)}")
         return None, None, None
@@ -263,7 +215,7 @@ async def check_token(token_address):
     if await check_rug(token_address):
         logging.info(f"Token {token_address} filtered out: Rug detected")
         return None, None, None
-    price_volatility = float(data.get("pair", {}).get("priceChange", {}).get("m5", 0)) if response_url and "dexscreener.com" in response_url else 0
+    price_volatility = float(data.get("pair", {}).get("priceChange", {}).get("m5", 0))
     if abs(price_volatility) > 15:
         logging.info(f"Token {token_address} filtered out: High volatility")
         return None, None, None
@@ -332,58 +284,19 @@ async def monitor_price(token_address, buy_price, market_cap, backtest=False):
             market_cap = float(data["market_cap"])
         else:
             response = session.get(f"{DEXSCREENER_PAIRS_API}/{token_address}")
-            response_url = response.url
             if response.status_code != 200:
-                if not JUPITER_API_KEY:
-                    logging.error(f"JUPITER_API_KEY missing, skipping Jupiter check for {token_address}")
-                    continue
-                jupiter_ips = await resolve_hostname("api.jup.ag")
-                if not jupiter_ips:
-                    logging.error(f"DNS resolution failed for api.jup.ag")
-                response = session.get(f"{JUPITER_API}?ids={token_address}", headers={"x-api-key": JUPITER_API_KEY})
-                if response.status_code != 200:
-                    if not BIRDEYE_API_KEY:
-                        logging.error(f"BIRDEYE_API_KEY missing, skipping Birdeye check for {token_address}")
-                        continue
-                    birdeye_ips = await resolve_hostname("public-api.birdeye.so")
-                    if not birdeye_ips:
-                        logging.error(f"DNS resolution failed for public-api.birdeye.so")
-                    response = session.get(f"{BIRDEYE_API}?address={token_address}", headers={"x-api-key": BIRDEYE_API_KEY})
-                    if response.status_code != 200:
-                        logging.error(f"Price check failed for {token_address}: Status {response.status_code} - {response.text}")
-                        break
-                try:
-                    data = response.json()
-                    if data is None or not isinstance(data, dict):
-                        logging.error(f"Price check failed for {token_address}: Invalid JSON response - {response.text}")
-                        break
-                except json.JSONDecodeError as e:
-                    logging.error(f"Price check failed for {token_address}: JSON decode error - {str(e)}")
+                logging.error(f"Price check failed for {token_address}: Status {response.status_code} - {response.text}")
+                break
+            try:
+                data = response.json()
+                if data is None or not isinstance(data, dict) or "pair" not in data or not data["pair"]:
+                    logging.error(f"Price check failed for {token_address}: Invalid JSON response - {response.text}")
                     break
-                response_url = response.url
-                if "jup.ag" in response_url:
-                    if token_address not in data.get("data", {}):
-                        logging.error(f"Price check failed for {token_address}: Token not found in Jupiter response")
-                        break
-                    current_price = float(data.get("data", {}).get(token_address, {}).get("price", 0))
-                    market_cap = float(data.get("data", {}).get(token_address, {}).get("marketCap", 0))
-                else:  # Birdeye
-                    if "value" not in data.get("data", {}):
-                        logging.error(f"Price check failed for {token_address}: Invalid Birdeye response - {response.text}")
-                        break
-                    current_price = float(data.get("data", {}).get("value", 0))
-                    market_cap = float(data.get("data", {}).get("mc", 0))
-            else:
-                try:
-                    data = response.json()
-                    if data is None or not isinstance(data, dict) or "pair" not in data or not data["pair"]:
-                        logging.error(f"Price check failed for {token_address}: Invalid JSON response - {response.text}")
-                        break
-                except json.JSONDecodeError as e:
-                    logging.error(f"Price check failed for {token_address}: JSON decode error - {str(e)}")
-                    break
-                current_price = float(data.get("pair", {}).get("priceUsd", 0))
-                market_cap = float(data.get("pair", {}).get("marketCap", 0))
+            except json.JSONDecodeError as e:
+                logging.error(f"Price check failed for {token_address}: JSON decode error - {str(e)}")
+                break
+            current_price = float(data.get("pair", {}).get("priceUsd", 0))
+            market_cap = float(data.get("pair", {}).get("marketCap", 0))
         peak_price = max(peak_price, current_price)
         gain = current_price / buy_price
         if not backtest and await check_rug(token_address):
@@ -458,13 +371,11 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         balance_status = "✅ Sufficient" if balance_ok else "❌ Low"
         dex_response = session.get(f"{DEXSCREENER_PAIRS_API}/So11111111111111111111111111111111111111112")
         dex_status = "✅ OK" if dex_response.status_code == 200 else f"❌ Failed (Status {dex_response.status_code})"
-        jup_status = "❌ JUPITER_API_KEY missing" if not JUPITER_API_KEY else "✅ OK" if session.get(f"{JUPITER_API}?ids=So11111111111111111111111111111111111111112", headers={"x-api-key": JUPITER_API_KEY}).status_code == 200 else "❌ Failed"
         shyft_status = "❌ SHYFT_API_KEY missing" if not SHYFT_API_KEY else "✅ OK" if session.get(f"https://api.shyft.to/sol/v1/events?network=mainnet-beta&address={RAYDIUM_PROGRAM}", headers={"x-api-key": SHYFT_API_KEY}).status_code == 200 else "❌ Failed"
         status_message = (
-            f"🔍 Bot Status Report\n"
+            f"🔍 KINGISBACK Sniper Bot Status Report\n"
             f"Wallet Balance: {balance_status}\n"
             f"DexScreener API: {dex_status}\n"
-            f"Jupiter API: {jup_status}\n"
             f"Shyft API: {shyft_status}\n"
             f"Active Positions: {len(active_positions)}\n"
             f"Trade Count Today: {trade_count}/{MAX_TRADES_PER_DAY}\n"
@@ -474,7 +385,7 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def logic(update: Update, context: ContextTypes.DEFAULT_TYPE):
     logic_message = (
-        f"📜 Trading Logic\n"
+        f"📜 KINGISBACK Sniper Bot Trading Logic\n"
         f"Market Cap Range: ${BASE_MIN_MARKET_CAP:,} - ${BASE_MAX_MARKET_CAP:,}\n"
         f"Min Liquidity: $50,000\n"
         f"Max Price Impact: {MAX_PRICE_IMPACT*100:.1f}%\n"
@@ -492,7 +403,7 @@ async def logic(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await send_notification(logic_message, context)
 
 async def backtest_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await send_notification("🚀 Starting backtest, bae! Results coming soon... 📊", context)
+    await send_notification("🚀 Starting backtest! Results coming soon... 📊", context)
     await backtest(context)
 
 async def start_telegram_bot():
@@ -510,7 +421,7 @@ async def start_telegram_bot():
 
 async def health_check():
     while True:
-        await send_notification("💖 Bot is running and scanning for MOONSHOTS! 😘")
+        await send_notification("💖 KINGISBACK Sniper Bot is running and scanning for MOONSHOTS! 😘")
         await asyncio.sleep(HEALTH_CHECK_INTERVAL)
 
 async def handle_callback(request):
@@ -523,7 +434,7 @@ async def handle_callback(request):
         return web.Response(text="Error", status=500)
 
 async def handle_health(request):
-    return web.Response(text="Bot is running")
+    return web.Response(text="KINGISBACK Sniper Bot is running")
 
 async def start_server():
     app = web.Application()
@@ -544,7 +455,7 @@ async def main():
     asyncio.create_task(start_telegram_bot())
     asyncio.create_task(health_check())
     asyncio.create_task(start_server())
-    await send_notification("💃 KINGISBACK Sniper Bot v2.0 is LIVE! Scanning Solana for 1000x MOONSHOTS! 🌟😘")
+    await send_notification("💃 KINGISBACK Sniper Bot v2.2 is LIVE! Scanning Solana for 1000x MOONSHOTS! 🌟😘")
     while True:
         if trade_count >= MAX_TRADES_PER_DAY and datetime.now().date() == last_trade_day:
             await asyncio.sleep(3600)
@@ -553,10 +464,7 @@ async def main():
             processed_tokens.clear()
             logging.info("Reset trade count and processed tokens for new day")
             continue
-        if not DEXSCREENER_API_KEY:
-            await send_notification("😿 DEXSCREENER_API_KEY missing, bae! Can’t scan tokens! 💔")
-            await asyncio.sleep(DATA_POLL_INTERVAL)
-            continue
+        tokens = []
         for attempt in range(3):
             try:
                 response = session.get(DEXSCREENER_TOKEN_API)
@@ -566,6 +474,7 @@ async def main():
                         if data is None or not isinstance(data, list) or not data:
                             logging.error(f"DexScreener Token API invalid response: {response.text}")
                             continue
+                        tokens = [token for token in data if token.get("chainId") == "solana" and token.get("tokenAddress")]
                         break
                     except json.JSONDecodeError as e:
                         logging.error(f"DexScreener Token API JSON decode error: {str(e)}")
@@ -576,39 +485,11 @@ async def main():
                 await send_notification(f"😿 DexScreener Token API error! {str(e)}, attempt {attempt+1}/3 💔")
                 logging.error(f"DexScreener Token API exception: {str(e)}")
             await asyncio.sleep(3 ** attempt)
-        else:
-            await send_notification("😿 DexScreener Token API down after retries! Falling back to pairs... 💔")
-            for attempt in range(3):
-                try:
-                    response = session.get(DEXSCREENER_PAIRS_API)
-                    if response.status_code == 200:
-                        try:
-                            data = response.json()
-                            if data is None or not isinstance(data, dict) or "pairs" not in data or not data["pairs"]:
-                                logging.error(f"DexScreener Pairs API invalid response: {response.text}")
-                                continue
-                            break
-                        except json.JSONDecodeError as e:
-                            logging.error(f"DexScreener Pairs API JSON decode error: {str(e)}")
-                            continue
-                    await send_notification(f"😿 DexScreener Pairs API failed! Status {response.status_code}, attempt {attempt+1}/3 💔")
-                    logging.error(f"DexScreener Pairs API failed: {response.status_code} - {response.text}")
-                except Exception as e:
-                    await send_notification(f"😿 DexScreener Pairs API error! {str(e)}, attempt {attempt+1}/3 💔")
-                    logging.error(f"DexScreener Pairs API exception: {str(e)}")
-                await asyncio.sleep(3 ** attempt)
-            if response.status_code != 200:
-                await send_notification(f"😿 DexScreener Pairs API down too! Retrying in {DATA_POLL_INTERVAL}s... 💔")
-                await asyncio.sleep(DATA_POLL_INTERVAL)
-                continue
-            data = {"pairs": data.get("pairs", [])}  # Adapt pairs response to tokens format
-        tokens = [token for token in data if token.get("chainId") == "solana"] if isinstance(data, list) else data.get("pairs", [])
         if not tokens:
-            logging.warning("No Solana tokens found in API response")
-            await asyncio.sleep(DATA_POLL_INTERVAL)
-            continue
+            logging.warning("No Solana tokens found in DexScreener Token API, falling back to engine")
+            tokens = [{"tokenAddress": addr} for addr in FALLBACK_TOKENS]
         for token in tokens:
-            token_address = token.get("tokenAddress") if isinstance(data, list) else token.get("baseToken", {}).get("address")
+            token_address = token.get("tokenAddress")
             if not token_address or token_address in processed_tokens:
                 continue
             # Validate token_address with pairs endpoint
