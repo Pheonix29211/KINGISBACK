@@ -4,3 +4,4 @@ solana==0.34.3
 pandas==2.2.2
 aiohttp==3.10.10
 dnspython==2.6.1
+python-telegram-bot==21.5
