@@ -1,3 +1,4 @@
+```python
 import asyncio
 import requests
 from solana.rpc.async_api import AsyncClient
@@ -14,6 +15,7 @@ import logging
 import pandas as pd
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
+from solders.instruction import Instruction
 
 # Setup logging
 logging.basicConfig(filename='logs/sniper_bot.log', level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -23,9 +25,7 @@ WALLET_PRIVATE_KEY = os.getenv("SOLANA_PRIVATE_KEY")
 SOLANA_RPC = os.getenv("SOLANA_RPC", "https://api.mainnet-beta.solana.com")
 DEXSCREENER_TOKEN_API = "https://api.dexscreener.com/token-profiles/latest/v1"
 DEXSCREENER_PAIRS_API = "https://api.dexscreener.com/latest/dex/pairs/solana"
-RUGCHECK_API = "https://api.rugcheck.xyz/v1/token"
-SHYFT_API = "https://api.shyft.to/sol/v1/callback/register"
-SHYFT_API_KEY = os.getenv("SHYFT_API_KEY")
+SOLANAFM_API = "https://api.solana.fm/v1/transactions"
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 BACKTEST_MODE = os.getenv("BACKTEST_MODE", "False") == "True"
@@ -49,7 +49,7 @@ MIN_SOL_BALANCE = 0.15  # 0.15 SOL minimum
 MAX_TOKEN_AGE = 6 * 3600  # 6 hours in seconds
 PORT = int(os.getenv("PORT", 8080))  # Render port, default 8080
 
-# Fallback token engine (from your document)
+# Fallback token engine (from provided document)
 FALLBACK_TOKENS = [
     "3trQxYokXbnxFThN2ppaCBqrodu9zyPPviaQf75MBAGS",
     "XbYpCajESGmRVor733e7e1uT9NLxdWxZMdXV3L4bonk",
@@ -111,63 +111,24 @@ async def check_wallet_balance(sol_client):
         await send_notification(f"😿 Wallet balance check failed! {str(e)} 💔")
         return False
 
-async def register_shyft_callback():
-    if not SHYFT_API_KEY:
-        logging.error("SHYFT_API_KEY missing, skipping callback registration")
-        return False
-    headers = {"x-api-key": SHYFT_API_KEY}
-    payload = {
-        "network": "mainnet-beta",
-        "addresses": [RAYDIUM_PROGRAM],
-        "callback_url": os.getenv("CALLBACK_URL")
-    }
-    for attempt in range(3):
-        try:
-            response = session.post(SHYFT_API, json=payload, headers=headers)
-            if response.status_code == 200:
-                await send_notification("💃 Shyft callback registered successfully! Rug-proof AF! 😘")
-                return True
-            else:
-                await send_notification(f"😿 Shyft callback failed! Status {response.status_code}, attempt {attempt+1}/3 💔")
-                logging.error(f"Shyft callback failed: {response.status_code} - {response.text}")
-        except Exception as e:
-            await send_notification(f"😿 Shyft callback error! {str(e)}, attempt {attempt+1}/3 💔")
-            logging.error(f"Shyft callback exception: {str(e)}")
-        await asyncio.sleep(3 ** attempt)  # Exponential backoff: 3s, 9s
-    await send_notification("😿 Shyft callback failed after retries! Check API key and CALLBACK_URL! 💔")
-    return False
-
 async def check_rug(token_address):
-    if not SHYFT_API_KEY:
-        logging.warning(f"SHYFT_API_KEY missing, skipping rug check for {token_address}")
-        return False
     try:
-        rug_response = session.get(f"{RUGCHECK_API}/{token_address}")
-        if rug_response.status_code == 200:
-            rug_data = rug_response.json()
-            if rug_data.get("risk_level") == "danger" or rug_data.get("top_holder_percentage", 0) > 75:
-                logging.info(f"Rug detected for {token_address}: High risk or top holder concentration")
-                return True
-    except Exception as e:
-        logging.error(f"Rugcheck API error for {token_address}: {str(e)}")
-    try:
-        shyft_response = session.get(f"https://api.shyft.to/sol/v1/events?network=mainnet-beta&address={token_address}", headers={"x-api-key": SHYFT_API_KEY})
-        if shyft_response.status_code == 200:
-            events = shyft_response.json().get("events", [])
+        response = session.get(f"{SOLANAFM_API}?address={token_address}")
+        if response.status_code == 200:
+            events = response.json().get("events", [])
             for event in events:
-                if event.get("type") in ["LIQUIDITY_WITHDRAWAL", "TOKEN_BURN"] and event.get("amount") > 8000:
-                    logging.info(f"Rug detected for {token_address}: Large liquidity withdrawal or burn")
+                if event.get("type") in ["LIQUIDITY_WITHDRAWAL", "TOKEN_BURN"] and event.get("amount", 0) > 8000:
+                    logging.info(f"Rug detected for {token_address}: Large withdrawal/burn")
                     return True
-                if event.get("type") == "TRANSFER" and event.get("from") == event.get("programId") and event.get("amount") > 800000:
-                    logging.info(f"Rug detected for {token_address}: Large program transfer")
+                if event.get("type") == "TRANSFER" and event.get("amount", 0) > 800000:
+                    logging.info(f"Rug detected for {token_address}: Large transfer")
                     return True
     except Exception as e:
-        logging.error(f"Shyft rug check error for {token_address}: {str(e)}")
+        logging.error(f"SolanaFM rug check error for {token_address}: {str(e)}")
     return False
 
 async def check_token(token_address):
     data = None
-    response_url = None
     for _ in range(3):
         try:
             response = session.get(f"{DEXSCREENER_PAIRS_API}/{token_address}")
@@ -178,7 +139,6 @@ async def check_token(token_address):
                         logging.error(f"DexScreener token check failed for {token_address}: Invalid JSON response - {response.text}")
                         data = None
                         continue
-                    response_url = response.url
                     break
                 except json.JSONDecodeError as e:
                     logging.error(f"DexScreener token check failed for {token_address}: JSON decode error - {str(e)}")
@@ -248,7 +208,7 @@ async def execute_trade(token_address, buy=True, backtest=False):
                 tx.add_instruction(
                     Instruction(
                         program_id=RAYDIUM_PROGRAM,
-                        data=bytes([0]),
+                        data=bytes([0]),  # Placeholder: Replace with actual Raydium swap instruction
                         accounts=[{"pubkey": keypair.pubkey(), "is_signer": True, "is_writable": True}]
                     )
                 )
@@ -371,12 +331,12 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         balance_status = "✅ Sufficient" if balance_ok else "❌ Low"
         dex_response = session.get(f"{DEXSCREENER_PAIRS_API}/So11111111111111111111111111111111111111112")
         dex_status = "✅ OK" if dex_response.status_code == 200 else f"❌ Failed (Status {dex_response.status_code})"
-        shyft_status = "❌ SHYFT_API_KEY missing" if not SHYFT_API_KEY else "✅ OK" if session.get(f"https://api.shyft.to/sol/v1/events?network=mainnet-beta&address={RAYDIUM_PROGRAM}", headers={"x-api-key": SHYFT_API_KEY}).status_code == 200 else "❌ Failed"
+        solanafm_status = "✅ OK" if session.get(f"{SOLANAFM_API}?address={RAYDIUM_PROGRAM}").status_code == 200 else "❌ Failed"
         status_message = (
             f"🔍 KINGISBACK Sniper Bot Status Report\n"
             f"Wallet Balance: {balance_status}\n"
             f"DexScreener API: {dex_status}\n"
-            f"Shyft API: {shyft_status}\n"
+            f"SolanaFM API: {solanafm_status}\n"
             f"Active Positions: {len(active_positions)}\n"
             f"Trade Count Today: {trade_count}/{MAX_TRADES_PER_DAY}\n"
             f"Last Trade Day: {last_trade_day}"
@@ -402,6 +362,16 @@ async def logic(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     await send_notification(logic_message, context)
 
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    help_message = (
+        f"📚 KINGISBACK Sniper Bot Commands\n"
+        f"?status - Check bot health, wallet balance, and API status\n"
+        f"?logic - View trading logic and parameters\n"
+        f"?backtest - Run backtest and get results\n"
+        f"?help - Show this help message"
+    )
+    await send_notification(help_message, context)
+
 async def backtest_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await send_notification("🚀 Starting backtest! Results coming soon... 📊", context)
     await backtest(context)
@@ -414,6 +384,7 @@ async def start_telegram_bot():
     application.add_handler(CommandHandler("backtest", backtest_command))
     application.add_handler(CommandHandler("status", status))
     application.add_handler(CommandHandler("logic", logic))
+    application.add_handler(CommandHandler("help", help_command))
     await application.initialize()
     await application.start()
     await application.updater.start_polling()
@@ -427,10 +398,10 @@ async def health_check():
 async def handle_callback(request):
     try:
         data = await request.json()
-        logging.info(f"Shyft callback received: {data}")
+        logging.info(f"SolanaFM callback received: {data}")
         return web.Response(text="OK")
     except Exception as e:
-        logging.error(f"Shyft callback error: {str(e)}")
+        logging.error(f"SolanaFM callback error: {str(e)}")
         return web.Response(text="Error", status=500)
 
 async def handle_health(request):
@@ -450,12 +421,10 @@ async def main():
     if BACKTEST_MODE:
         await backtest()
         return
-    if not await register_shyft_callback():
-        logging.warning("Failed to register Shyft callback, continuing without it")
     asyncio.create_task(start_telegram_bot())
     asyncio.create_task(health_check())
     asyncio.create_task(start_server())
-    await send_notification("💃 KINGISBACK Sniper Bot v2.2 is LIVE! Scanning Solana for 1000x MOONSHOTS! 🌟😘")
+    await send_notification("💃 KINGISBACK Sniper Bot v2.3 is LIVE! Scanning Solana for 1000x MOONSHOTS! 🌟😘")
     while True:
         if trade_count >= MAX_TRADES_PER_DAY and datetime.now().date() == last_trade_day:
             await asyncio.sleep(3600)
@@ -492,7 +461,6 @@ async def main():
             token_address = token.get("tokenAddress")
             if not token_address or token_address in processed_tokens:
                 continue
-            # Validate token_address with pairs endpoint
             for attempt in range(3):
                 try:
                     pair_response = session.get(f"{DEXSCREENER_PAIRS_API}/{token_address}")
@@ -522,3 +490,4 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+```
