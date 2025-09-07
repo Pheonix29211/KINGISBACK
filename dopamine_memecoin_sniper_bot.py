@@ -96,10 +96,14 @@ async def send_notification(message, context=None, is_win=True):
     logging.info(f"{datetime.now()}: {message}")
 
 async def check_wallet_balance(sol_client):
-    """Checks Solana wallet balance with retries."""
+    """Checks Solana wallet balance with enhanced retries."""
+    if not WALLET_PRIVATE_KEY:
+        logging.error("SOLANA_PRIVATE_KEY missing")
+        await send_notification("😿 SOLANA_PRIVATE_KEY missing! Cannot check wallet balance. 💔")
+        return False, 0
     try:
         keypair = Keypair.from_base58_string(WALLET_PRIVATE_KEY)
-        for _ in range(3):
+        for _ in range(5):  # Increased retries
             try:
                 balance = await sol_client.get_balance(keypair.pubkey())
                 sol_balance = balance.value / 1_000_000_000
@@ -109,8 +113,8 @@ async def check_wallet_balance(sol_client):
                 return True, sol_balance
             except Exception as e:
                 logging.error(f"Wallet balance check attempt failed: {str(e)}")
-                await asyncio.sleep(5)
-        await send_notification(f"😿 Wallet balance check failed after retries! 💔")
+                await asyncio.sleep(10)  # Longer delay for RPC
+        await send_notification(f"😿 Wallet balance check failed after retries! Check SOLANA_RPC or WALLET_PRIVATE_KEY. 💔")
         return False, 0
     except Exception as e:
         logging.error(f"Wallet balance check error: {str(e)}")
@@ -386,7 +390,7 @@ async def monitor_price(token_address, buy_price, market_cap, paper=False):
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Sends a welcome message to start the bot."""
     try:
-        await send_notification("💃 Dopamine Memecoin Sniper Bot v3.6 is LIVE! Ready to snipe Solana MOONSHOTS! 🌟😘", context)
+        await send_notification("💃 Dopamine Memecoin Sniper Bot v3.7 is LIVE! Ready to snipe Solana MOONSHOTS! 🌟😘", context)
     except Exception as e:
         logging.error(f"Error in /start command: {str(e)}")
         await send_notification(f"😿 Error in /start command: {str(e)} 💔", context)
@@ -711,7 +715,7 @@ async def main():
     asyncio.create_task(start_telegram_bot())
     asyncio.create_task(health_check())
     asyncio.create_task(start_server())
-    await send_notification("💃 Dopamine Memecoin Sniper Bot v3.6 is LIVE! Scanning Solana for 1000x MOONSHOTS! 🌟😘")
+    await send_notification("💃 Dopamine Memecoin Sniper Bot v3.7 is LIVE! Scanning Solana for 1000x MOONSHOTS! 🌟😘")
     while True:
         if trade_count >= MAX_TRADES_PER_DAY and datetime.now().date() == last_trade_day:
             await asyncio.sleep(3600)
