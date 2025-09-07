@@ -131,7 +131,7 @@ async def check_token(token_address):
         return None, None, None
     try:
         market_cap = float(data.get("pair", {}).get("marketCap", 0))
-        liquidity = float(data.get("pair", {})..get("liquidity", {}).get("usd", 0))
+        liquidity = float(data.get("pair", {}).get("liquidity", {}).get("usd", 0))
         price = float(data.get("pair", {}).get("priceUsd", 0))
         price_impact = float(data.get("pair", {}).get("priceChange", {}).get("m5", 0))
         created_at = data.get("pair", {}).get("createdAt", None)
