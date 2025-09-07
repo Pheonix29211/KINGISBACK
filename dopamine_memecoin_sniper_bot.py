@@ -23,35 +23,43 @@ logging.basicConfig(filename='logs/sniper_bot.log', level=logging.INFO, format='
 # Configuration
 WALLET_PRIVATE_KEY = os.getenv("SOLANA_PRIVATE_KEY")
 SOLANA_RPC = os.getenv("SOLANA_RPC", "https://api.mainnet-beta.solana.com")
+SHYFT_API_KEY = os.getenv("SHYFT_API_KEY")
 DEXSCREENER_TOKEN_API = "https://api.dexscreener.com/token-profiles/latest/v1"
 DEXSCREENER_PAIRS_API = "https://api.dexscreener.com/latest/dex/pairs/solana"
-SOLANAFM_API = "https://api.solana.fm/v1/transactions"
+SHYFT_API = "https://api.shyft.to/sol/v1/token"
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 BACKTEST_MODE = os.getenv("BACKTEST_MODE", "False") == "True"
-BASE_MIN_MARKET_CAP = 10000 # $10k
-BASE_MAX_MARKET_CAP = 200000 # $200k
-BUY_AMOUNT_MIN = 0.048387 # ~$15 at $310/SOL
-BUY_AMOUNT_MAX = 0.048387 # ~$15 at $310/SOL
-PROFIT_REINVEST_RATIO = 0.5 # Reinvest 50% profits
-EARLY_SELL_PROFIT = 1.3 # 1.3x for rug/dump
-STOP_LOSS = 0.9 # 10% loss
-TRAILING_STOP = 0.98 # 2% below peak
-SLIPPAGE = 0.03 # 3% slippage
-MAX_PRICE_IMPACT = 0.05 # 5% max price impact
-LOSS_STREAK_THRESHOLD = 3 # Pain after 3 losses
-MAX_TRADES_PER_DAY = 4 # 3-4 signals daily
+ENTRY_MC_MIN = 75000  # $75k
+ENTRY_MC_MAX = 2000000  # $2M
+ENTRY_LP_MIN_USD = 30000  # $30k
+ENTRY_LP_TO_MCAP_MIN = 0.15  # 15%
+ENTRY_POOL_AGE_MIN = 60  # 60 seconds
+VOL1H_MIN = 50000  # $50k
+ACCEL_MIN = 0.8  # 0.8
+BUY_AMOUNT_MIN = 0.048387  # ~$15 at $310/SOL
+BUY_AMOUNT_MAX = 0.048387  # ~$15 at $310/SOL
+PROFIT_REINVEST_RATIO = 0.5  # Reinvest 50% profits
+EARLY_SELL_PROFIT = 1.3  # 1.3x for rug/dump
+STOP_LOSS = 0.9  # 10% loss
+TRAILING_STOP = 0.98  # 2% below peak
+SLIPPAGE = 0.03  # 3% slippage
+MAX_PRICE_IMPACT = 0.05  # 5% max price impact
+LOSS_STREAK_THRESHOLD = 3  # Pain after 3 losses
+MAX_TRADES_PER_DAY = 4  # 3-4 signals daily
 RAYDIUM_PROGRAM = "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8"
 HEALTH_CHECK_INTERVAL = 300 # 5 minutes
 DATA_POLL_INTERVAL = 10 # 10 seconds for faster memecoin sniping
-PRIORITY_FEE = 0.0005 # 0.0005 SOL base fee
+PRIORITY_FEE = 0.002  # Increased to 0.002 SOL for better transaction success
 MIN_SOL_BALANCE = 0.15 # 0.15 SOL minimum
 MAX_TOKEN_AGE = 6 * 3600 # 6 hours in seconds
 PORT = int(os.getenv("PORT", 8080)) # Render port, default 8080
+
 # HTTP session with retries
 session = requests.Session()
 retries = Retry(total=5, backoff_factor=3, status_forcelist=[429, 500, 502, 503, 504])
 session.mount("https://", HTTPAdapter(max_retries=retries))
+
 # Global state
 loss_streak = 0
 trade_count = 0
@@ -61,6 +69,7 @@ backtest_trades = []
 active_positions = {} # token: buy_price
 backtest_data_cache = {}
 processed_tokens = set() # Track processed token addresses
+
 async def send_notification(message, context=None, is_win=True):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         logging.error("Telegram bot token or chat ID missing")
@@ -77,6 +86,7 @@ async def send_notification(message, context=None, is_win=True):
             logging.error(f"Telegram notification error: {str(e)}")
         await asyncio.sleep(1)
     logging.info(f"{datetime.now()}: {message}")
+
 async def check_wallet_balance(sol_client):
     keypair = Keypair.from_base58_string(WALLET_PRIVATE_KEY)
     try:
@@ -90,21 +100,17 @@ async def check_wallet_balance(sol_client):
         logging.error(f"Wallet balance check failed: {str(e)}")
         await send_notification(f"😿 Wallet balance check failed! {str(e)} 💔")
         return False
+
 async def check_rug(token_address):
-    try:
-        response = session.get(f"{SOLANAFM_API}?address={token_address}")
-        if response.status_code == 200:
-            events = response.json().get("events", [])
-            for event in events:
-                if event.get("type") in ["LIQUIDITY_WITHDRAWAL", "TOKEN_BURN"] and event.get("amount", 0) > 8000:
-                    logging.info(f"Rug detected for {token_address}: Large withdrawal/burn")
-                    return True
-                if event.get("type") == "TRANSFER" and event.get("amount", 0) > 800000:
-                    logging.info(f"Rug detected for {token_address}: Large transfer")
-                    return True
-    except Exception as e:
-        logging.error(f"SolanaFM rug check error for {token_address}: {str(e)}")
+    headers = {"x-api-key": SHYFT_API_KEY}
+    response = session.get(f"{SHYFT_API}/{token_address}", headers=headers)
+    if response.status_code == 200:
+        data = response.json().get("result", {})
+        if data.get("is_suspicious") or not data.get("liquidity_locked"):
+            logging.info(f"Rug detected for {token_address}: Suspicious or unlocked liquidity")
+            return True
     return False
+
 async def check_token(token_address):
     data = None
     for _ in range(3):
@@ -135,16 +141,22 @@ async def check_token(token_address):
         price = float(data.get("pair", {}).get("priceUsd", 0))
         price_impact = float(data.get("pair", {}).get("priceChange", {}).get("m5", 0))
         created_at = data.get("pair", {}).get("createdAt", None)
+        volume_1h = float(data.get("pair", {}).get("volume", {}).get("h1", 0))
+        price_change_1h = float(data.get("pair", {}).get("priceChange", {}).get("h1", 0))
+        acceleration = price_change_1h / 60 if price_change_1h > 0 else 0  # Simple acceleration calculation (change per minute)
     except (ValueError, TypeError) as e:
         logging.error(f"Data parsing error for {token_address}: {str(e)}")
         return None, None, None
     max_cap = BASE_MAX_MARKET_CAP / (2 if loss_streak >= LOSS_STREAK_THRESHOLD else 1)
-    if not (BASE_MIN_MARKET_CAP <= market_cap <= max_cap) or liquidity < 50000 or abs(price_impact) > MAX_PRICE_IMPACT:
-        logging.info(f"Token {token_address} filtered out: market_cap={market_cap}, liquidity={liquidity}, price_impact={price_impact}")
+    if not (ENTRY_MC_MIN <= market_cap <= ENTRY_MC_MAX) or liquidity < ENTRY_LP_MIN_USD or (liquidity / market_cap) < ENTRY_LP_TO_MCAP_MIN or abs(price_impact) > MAX_PRICE_IMPACT or volume_1h < VOL1H_MIN or acceleration < ACCEL_MIN:
+        logging.info(f"Token {token_address} filtered out: market_cap={market_cap}, liquidity={liquidity}, lp_to_mcap={liquidity / market_cap}, price_impact={price_impact}, volume_1h={volume_1h}, acceleration={acceleration}")
         return None, None, None
     if created_at:
         try:
             created_time = datetime.fromtimestamp(created_at / 1000)
+            if (datetime.now() - created_time).total_seconds() < ENTRY_POOL_AGE_MIN:
+                logging.info(f"Token {token_address} filtered out: Too new (age < 60 seconds)")
+                return None, None, None
             if (datetime.now() - created_time).total_seconds() > MAX_TOKEN_AGE:
                 logging.info(f"Token {token_address} filtered out: Too old")
                 return None, None, None
@@ -159,6 +171,7 @@ async def check_token(token_address):
         return None, None, None
     logging.info(f"Token {token_address} passed checks: market_cap={market_cap}, price={price}, liquidity={liquidity}")
     return market_cap, price, liquidity
+
 async def execute_trade(token_address, buy=True, backtest=False):
     global loss_streak, trade_count, active_positions, gain, current_buy_amount
     if backtest:
@@ -207,6 +220,7 @@ async def execute_trade(token_address, buy=True, backtest=False):
                 await asyncio.sleep(1)
         await send_notification(f"😿 Trade failed for {token_address} after retries! Check SOLANA_RPC or balance! 💔")
         return False
+
 async def monitor_price(token_address, buy_price, market_cap, backtest=False):
     global loss_streak, backtest_trades, gain
     peak_price = buy_price
