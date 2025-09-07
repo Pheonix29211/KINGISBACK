@@ -18,7 +18,7 @@ from urllib3.util.retry import Retry
 from solders.instruction import Instruction, AccountMeta
 from solders.pubkey import Pubkey
 
-# Setup logging
+# Setup logging to Render disk
 logging.basicConfig(filename='/opt/render/project/src/data/sniper_bot.log', level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 # Configuration
@@ -95,58 +95,76 @@ async def send_notification(message, context=None, is_win=True):
     logging.info(f"{datetime.now()}: {message}")
 
 async def check_wallet_balance(sol_client):
-    keypair = Keypair.from_base58_string(WALLET_PRIVATE_KEY)
-    for _ in range(3):
-        try:
-            balance = await sol_client.get_balance(keypair.pubkey())
-            sol_balance = balance.value / 1_000_000_000
-            if sol_balance < MIN_SOL_BALANCE:
-                await send_notification(f"😿 Low balance! Only {sol_balance:.4f} SOL left, need {MIN_SOL_BALANCE} SOL! 💔")
-                return False, sol_balance
-            return True, sol_balance
-        except Exception as e:
-            logging.error(f"Wallet balance check failed: {str(e)}")
-            await asyncio.sleep(5)
-    await send_notification(f"😿 Wallet balance check failed after retries! 💔")
-    return False, 0
+    try:
+        keypair = Keypair.from_base58_string(WALLET_PRIVATE_KEY)
+        for _ in range(3):
+            try:
+                balance = await sol_client.get_balance(keypair.pubkey())
+                sol_balance = balance.value / 1_000_000_000
+                if sol_balance < MIN_SOL_BALANCE:
+                    await send_notification(f"😿 Low balance! Only {sol_balance:.4f} SOL left, need {MIN_SOL_BALANCE} SOL! 💔")
+                    return False, sol_balance
+                return True, sol_balance
+            except Exception as e:
+                logging.error(f"Wallet balance check attempt failed: {str(e)}")
+                await asyncio.sleep(5)
+        await send_notification(f"😿 Wallet balance check failed after retries! 💔")
+        return False, 0
+    except Exception as e:
+        logging.error(f"Wallet balance check error: {str(e)}")
+        await send_notification(f"😿 Wallet balance check error: {str(e)} 💔")
+        return False, 0
 
 async def check_rug(token_address):
     if not SHYFT_API_KEY:
         logging.error("Shyft API key missing")
+        await send_notification("😿 Shyft API key missing! Cannot perform rug checks. 💔")
         return False
     try:
         headers = {"x-api-key": SHYFT_API_KEY}
-        response = session.get(f"{SHYFT_API}/{token_address}", headers=headers)
-        if response.status_code == 200:
-            data = response.json().get("result", {})
-            if data.get("is_suspicious") or not data.get("liquidity_locked"):
-                logging.info(f"Rug detected for {token_address}: Suspicious or unlocked liquidity")
-                return True
+        for _ in range(3):
+            try:
+                response = session.get(f"{SHYFT_API}/{token_address}", headers=headers)
+                if response.status_code == 200:
+                    data = response.json().get("result", {})
+                    if data.get("is_suspicious") or not data.get("liquidity_locked"):
+                        logging.info(f"Rug detected for {token_address}: Suspicious or unlocked liquidity")
+                        return True
+                    return False
+                logging.error(f"Shyft rug check failed for {token_address}: Status {response.status_code} - {response.text}")
+            except Exception as e:
+                logging.error(f"Shyft rug check attempt failed for {token_address}: {str(e)}")
+            await asyncio.sleep(3)
+        logging.error(f"Shyft rug check failed for {token_address} after retries")
         return False
     except Exception as e:
         logging.error(f"Shyft rug check error for {token_address}: {str(e)}")
         return False
 
 async def calculate_atr(token_address, current_price):
-    if token_address not in price_history:
-        price_history[token_address] = []
-    high = current_price
-    low = current_price
-    close = current_price
-    if price_history[token_address]:
-        prev_close = price_history[token_address][-1]["close"]
-        high = max(high, prev_close)
-        low = min(low, prev_close)
-    price_history[token_address].append({"high": high, "low": low, "close": close})
-    if len(price_history[token_address]) > ATR_PERIOD:
-        price_history[token_address] = price_history[token_address][-ATR_PERIOD:]
-    true_ranges = []
-    for i in range(1, len(price_history[token_address])):
-        high_low = price_history[token_address][i]["high"] - price_history[token_address][i]["low"]
-        high_prev_close = abs(price_history[token_address][i]["high"] - price_history[token_address][i-1]["close"])
-        low_prev_close = abs(price_history[token_address][i]["low"] - price_history[token_address][i-1]["close"])
-        true_ranges.append(max(high_low, high_prev_close, low_prev_close))
-    return sum(true_ranges) / len(true_ranges) if true_ranges else 0
+    try:
+        if token_address not in price_history:
+            price_history[token_address] = []
+        high = current_price
+        low = current_price
+        close = current_price
+        if price_history[token_address]:
+            prev_close = price_history[token_address][-1]["close"]
+            high = max(high, prev_close)
+            low = min(low, prev_close)
+        price_history[token_address].append({"high": high, "low": low, "close": close})
+        if len(price_history[token_address]) > ATR_PERIOD:
+            price_history[token_address] = price_history[token_address][-ATR_PERIOD:]
+        true_ranges = []
+        for i in range(1, len(price_history[token_address])):
+            high_low = price_history[token_address][i]["high"] - price_history[token_address][i]["low"]
+            high_prev_close = abs(price_history[token_address][i]["high"] - price_history[token_address][i-1]["close"])
+            low_prev_close = abs(price_history[token_address][i]["low"] - price_history[token_address][i-1]["close"])
+            true_ranges.append(max(high_low, high_prev_close, low_prev_close))
+        return sum(true_ranges) / len(true_ranges) if true_ranges else 0
+    except Exception as e:
+        logging.error(f"ATR calculation error for {token_address}: {str(e)}")
+        return 0
 
 async def check_token(token_address):
     cache_key = f"{DEXSCREENER_PAIRS_API}/{token_address}"
@@ -215,173 +233,189 @@ async def check_token(token_address):
     return market_cap, price, liquidity
 
 async def execute_trade(token_address, buy=True, paper=False):
-    global loss_streak, trade_count, active_positions, current_buy_amount, paper_trades
-    if paper or paper_trading:
-        logging.info(f"Paper trade: {'Buying' if buy else 'Selling'} {token_address} with {current_buy_amount} SOL")
-        if buy:
-            market_cap, buy_price, _ = await check_token(token_address)
-            atr = await calculate_atr(token_address, buy_price)
-            active_positions[token_address] = {"buy_price": buy_price, "gain": 1.0, "atr": atr, "trailing_stop": buy_price - atr * ATR_MULTIPLIER}
-            paper_trades.append({"token": token_address, "buy_price": buy_price, "amount": current_buy_amount, "timestamp": datetime.now().isoformat(), "type": "buy"})
-        else:
-            profit = (active_positions[token_address]["gain"] - 1) * current_buy_amount * 310
-            paper_trades.append({"token": token_address, "sell_price": active_positions[token_address]["buy_price"] * active_positions[token_address]["gain"], "profit": profit, "timestamp": datetime.now().isoformat(), "type": "sell"})
-            if profit > 0:
-                current_buy_amount = min(BUY_AMOUNT_MAX * 2, current_buy_amount + profit * PROFIT_REINVEST_RATIO / 310)
-            active_positions.pop(token_address, None)
-        return True
-    async with AsyncClient(SOLANA_RPC) as sol_client:
-        keypair = Keypair.from_base58_string(WALLET_PRIVATE_KEY)
-        if not (await check_wallet_balance(sol_client))[0]:
-            return False
-        token_mint = Pubkey.from_string(token_address)
-        token_account = get_associated_token_address(keypair.pubkey(), token_mint)
-        tx = Transaction()
-        account_info = await sol_client.get_account_info(token_account)
-        if not account_info.value:
-            tx.add(create_associated_token_account(keypair.pubkey(), keypair.pubkey(), token_mint))
-        tx.add(
-            Instruction(
-                program_id=Pubkey.from_string("675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8"),
-                data=bytes([1 if buy else 2]),
-                accounts=[
-                    AccountMeta(pubkey=keypair.pubkey(), is_signer=True, is_writable=True),
-                    AccountMeta(pubkey=token_account, is_signer=False, is_writable=True),
-                ]
+    try:
+        global loss_streak, trade_count, active_positions, current_buy_amount, paper_trades
+        if paper or paper_trading:
+            logging.info(f"Paper trade: {'Buying' if buy else 'Selling'} {token_address} with {current_buy_amount} SOL")
+            if buy:
+                market_cap, buy_price, _ = await check_token(token_address)
+                if not market_cap:
+                    return False
+                atr = await calculate_atr(token_address, buy_price)
+                active_positions[token_address] = {"buy_price": buy_price, "gain": 1.0, "atr": atr, "trailing_stop": buy_price - atr * ATR_MULTIPLIER}
+                paper_trades.append({"token": token_address, "buy_price": buy_price, "amount": current_buy_amount, "timestamp": datetime.now().isoformat(), "type": "buy"})
+            else:
+                profit = (active_positions[token_address]["gain"] - 1) * current_buy_amount * 310
+                paper_trades.append({"token": token_address, "sell_price": active_positions[token_address]["buy_price"] * active_positions[token_address]["gain"], "profit": profit, "timestamp": datetime.now().isoformat(), "type": "sell"})
+                if profit > 0:
+                    current_buy_amount = min(BUY_AMOUNT_MAX * 2, current_buy_amount + profit * PROFIT_REINVEST_RATIO / 310)
+                active_positions.pop(token_address, None)
+            return True
+        async with AsyncClient(SOLANA_RPC) as sol_client:
+            keypair = Keypair.from_base58_string(WALLET_PRIVATE_KEY)
+            if not (await check_wallet_balance(sol_client))[0]:
+                return False
+            token_mint = Pubkey.from_string(token_address)
+            token_account = get_associated_token_address(keypair.pubkey(), token_mint)
+            tx = Transaction()
+            account_info = await sol_client.get_account_info(token_account)
+            if not account_info.value:
+                tx.add(create_associated_token_account(keypair.pubkey(), keypair.pubkey(), token_mint))
+            tx.add(
+                Instruction(
+                    program_id=Pubkey.from_string("675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8"),
+                    data=bytes([1 if buy else 2]),
+                    accounts=[
+                        AccountMeta(pubkey=keypair.pubkey(), is_signer=True, is_writable=True),
+                        AccountMeta(pubkey=token_account, is_signer=False, is_writable=True),
+                    ]
+                )
             )
-        )
-        for _ in range(3):
-            try:
-                blockhash = await sol_client.get_latest_blockhash()
-                tx.recent_blockhash = blockhash.value.blockhash
-                tx.fee_payer = keypair.pubkey()
-                # await sol_client.send_transaction(tx, keypair, opts={"priority_fee": PRIORITY_FEE})
-                if buy:
-                    market_cap, buy_price, _ = await check_token(token_address)
-                    atr = await calculate_atr(token_address, buy_price)
-                    await send_notification(f"🚀 Sniping {token_address} at ${market_cap} with {current_buy_amount} SOL (~$15)! MOON TIME! 😘")
-                    active_positions[token_address] = {"buy_price": buy_price, "gain": 1.0, "atr": atr, "trailing_stop": buy_price - atr * ATR_MULTIPLIER}
-                else:
-                    profit = (active_positions[token_address]["gain"] - 1) * current_buy_amount * 310
-                    await send_notification(
-                        f"💸 Sold {token_address}! Profit: {active_positions[token_address]['gain']:.2f}x 🤑"
-                        if active_positions[token_address]["gain"] > 1
-                        else f"😢 Sold {token_address}, loss taken. Let’s bounce back! 💔",
-                        is_win=active_positions[token_address]["gain"] > 1
-                    )
-                    if profit > 0:
-                        current_buy_amount = min(BUY_AMOUNT_MAX * 2, current_buy_amount + profit * PROFIT_REINVEST_RATIO / 310)
-                    active_positions.pop(token_address, None)
-                trade_count += 1
-                return True
-            except Exception as e:
-                await send_notification(f"😿 Trade error for {token_address}! {str(e)} Retrying... 💔")
-                logging.error(f"Trade error for {token_address}: {str(e)}")
-                await asyncio.sleep(1)
-        await send_notification(f"😿 Trade failed for {token_address} after retries! Check SOLANA_RPC or balance! 💔")
+            for _ in range(3):
+                try:
+                    blockhash = await sol_client.get_latest_blockhash()
+                    tx.recent_blockhash = blockhash.value.blockhash
+                    tx.fee_payer = keypair.pubkey()
+                    # await sol_client.send_transaction(tx, keypair, opts={"priority_fee": PRIORITY_FEE})
+                    if buy:
+                        market_cap, buy_price, _ = await check_token(token_address)
+                        if not market_cap:
+                            return False
+                        atr = await calculate_atr(token_address, buy_price)
+                        await send_notification(f"🚀 Sniping {token_address} at ${market_cap} with {current_buy_amount} SOL (~$15)! MOON TIME! 😘")
+                        active_positions[token_address] = {"buy_price": buy_price, "gain": 1.0, "atr": atr, "trailing_stop": buy_price - atr * ATR_MULTIPLIER}
+                    else:
+                        profit = (active_positions[token_address]["gain"] - 1) * current_buy_amount * 310
+                        await send_notification(
+                            f"💸 Sold {token_address}! Profit: {active_positions[token_address]['gain']:.2f}x 🤑"
+                            if active_positions[token_address]["gain"] > 1
+                            else f"😢 Sold {token_address}, loss taken. Let’s bounce back! 💔",
+                            is_win=active_positions[token_address]["gain"] > 1
+                        )
+                        if profit > 0:
+                            current_buy_amount = min(BUY_AMOUNT_MAX * 2, current_buy_amount + profit * PROFIT_REINVEST_RATIO / 310)
+                        active_positions.pop(token_address, None)
+                    trade_count += 1
+                    return True
+                except Exception as e:
+                    await send_notification(f"😿 Trade error for {token_address}! {str(e)} Retrying... 💔")
+                    logging.error(f"Trade error for {token_address}: {str(e)}")
+                    await asyncio.sleep(1)
+            await send_notification(f"😿 Trade failed for {token_address} after retries! Check SOLANA_RPC or balance! 💔")
+            return False
+    except Exception as e:
+        logging.error(f"Execute trade error for {token_address}: {str(e)}")
         return False
 
 async def monitor_price(token_address, buy_price, market_cap, paper=False):
-    global loss_streak, paper_trades
-    start_time = datetime.now()
-    while (datetime.now() - start_time).seconds < 7200:
-        if paper or paper_trading:
-            cache_key = f"{DEXSCREENER_PAIRS_API}/{token_address}"
-            cached_data, cached_time = api_cache.get(cache_key, (None, 0))
-            if cached_data and datetime.now().timestamp() - cached_time < 30:
-                data = cached_data
-            else:
-                response = session.get(f"{DEXSCREENER_PAIRS_API}/{token_address}")
-                if response.status_code != 200:
-                    logging.error(f"Price check failed for {token_address}: Status {response.status_code} - {response.text}")
-                    break
-                try:
-                    data = response.json()
-                    if data is None or not isinstance(data, dict) or "pair" not in data or not data["pair"]:
-                        logging.error(f"Price check failed for {token_address}: Invalid JSON response - {response.text}")
+    try:
+        global loss_streak, paper_trades
+        start_time = datetime.now()
+        while (datetime.now() - start_time).seconds < 7200:
+            if paper or paper_trading:
+                cache_key = f"{DEXSCREENER_PAIRS_API}/{token_address}"
+                cached_data, cached_time = api_cache.get(cache_key, (None, 0))
+                if cached_data and datetime.now().timestamp() - cached_time < 30:
+                    data = cached_data
+                else:
+                    response = session.get(f"{DEXSCREENER_PAIRS_API}/{token_address}")
+                    if response.status_code != 200:
+                        logging.error(f"Price check failed for {token_address}: Status {response.status_code} - {response.text}")
                         break
-                    api_cache[cache_key] = (data, datetime.now().timestamp())
-                except json.JSONDecodeError as e:
-                    logging.error(f"Price check failed for {token_address}: JSON decode error - {str(e)}")
-                    break
-            current_price = float(data.get("pair", {}).get("priceUsd", 0))
-            market_cap = float(data.get("pair", {}).get("marketCap", 0))
-        else:
-            cache_key = f"{DEXSCREENER_PAIRS_API}/{token_address}"
-            cached_data, cached_time = api_cache.get(cache_key, (None, 0))
-            if cached_data and datetime.now().timestamp() - cached_time < 30:
-                data = cached_data
-            else:
-                response = session.get(f"{DEXSCREENER_PAIRS_API}/{token_address}")
-                if response.status_code != 200:
-                    logging.error(f"Price check failed for {token_address}: Status {response.status_code} - {response.text}")
-                    break
-                try:
-                    data = response.json()
-                    if data is None or not isinstance(data, dict) or "pair" not in data or not data["pair"]:
-                        logging.error(f"Price check failed for {token_address}: Invalid JSON response - {response.text}")
+                    try:
+                        data = response.json()
+                        if data is None or not isinstance(data, dict) or "pair" not in data or not data["pair"]:
+                            logging.error(f"Price check failed for {token_address}: Invalid JSON response - {response.text}")
+                            break
+                        api_cache[cache_key] = (data, datetime.now().timestamp())
+                    except json.JSONDecodeError as e:
+                        logging.error(f"Price check failed for {token_address}: JSON decode error - {str(e)}")
                         break
-                    api_cache[cache_key] = (data, datetime.now().timestamp())
-                except json.JSONDecodeError as e:
-                    logging.error(f"Price check failed for {token_address}: JSON decode error - {str(e)}")
-                    break
-            current_price = float(data.get("pair", {}).get("priceUsd", 0))
-            market_cap = float(data.get("pair", {}).get("marketCap", 0))
-        atr = await calculate_atr(token_address, current_price)
-        active_positions[token_address]["atr"] = atr
-        active_positions[token_address]["trailing_stop"] = current_price - atr * ATR_MULTIPLIER
-        active_positions[token_address]["gain"] = current_price / buy_price
-        if not (paper or paper_trading) and await check_rug(token_address):
-            await execute_trade(token_address, buy=False, paper=paper)
-            profit = (current_price - buy_price) * current_buy_amount * 310
-            await send_notification(f"😾 Rug alert on {token_address}! Sold at ${current_price:.2f} for {profit:.1f}%! Saved our bag! 😿", is_win=profit > 0)
-            loss_streak = loss_streak + 1 if current_price < buy_price else 0
-            paper_trades.append({"token": token_address, "sell_price": current_price, "profit": profit, "timestamp": datetime.now().isoformat(), "type": "sell"})
-            break
-        if current_price <= active_positions[token_address]["trailing_stop"]:
-            await execute_trade(token_address, buy=False, paper=paper)
-            profit = (current_price - buy_price) * current_buy_amount * 310
-            await send_notification(f"💸 Trailing stop hit for {token_address} at ${current_price:.2f} for {profit:.1f}%! 💪", is_win=profit > 0)
-            loss_streak = loss_streak + 1 if current_price < buy_price else 0
-            paper_trades.append({"token": token_address, "sell_price": current_price, "profit": profit, "timestamp": datetime.now().isoformat(), "type": "sell"})
-            break
-        await asyncio.sleep(DATA_POLL_INTERVAL)
+                current_price = float(data.get("pair", {}).get("priceUsd", 0))
+                market_cap = float(data.get("pair", {}).get("marketCap", 0))
+            else:
+                cache_key = f"{DEXSCREENER_PAIRS_API}/{token_address}"
+                cached_data, cached_time = api_cache.get(cache_key, (None, 0))
+                if cached_data and datetime.now().timestamp() - cached_time < 30:
+                    data = cached_data
+                else:
+                    response = session.get(f"{DEXSCREENER_PAIRS_API}/{token_address}")
+                    if response.status_code != 200:
+                        logging.error(f"Price check failed for {token_address}: Status {response.status_code} - {response.text}")
+                        break
+                    try:
+                        data = response.json()
+                        if data is None or not isinstance(data, dict) or "pair" not in data or not data["pair"]:
+                            logging.error(f"Price check failed for {token_address}: Invalid JSON response - {response.text}")
+                            break
+                        api_cache[cache_key] = (data, datetime.now().timestamp())
+                    except json.JSONDecodeError as e:
+                        logging.error(f"Price check failed for {token_address}: JSON decode error - {str(e)}")
+                        break
+                current_price = float(data.get("pair", {}).get("priceUsd", 0))
+                market_cap = float(data.get("pair", {}).get("marketCap", 0))
+            atr = await calculate_atr(token_address, current_price)
+            active_positions[token_address]["atr"] = atr
+            active_positions[token_address]["trailing_stop"] = current_price - atr * ATR_MULTIPLIER
+            active_positions[token_address]["gain"] = current_price / buy_price
+            if not (paper or paper_trading) and await check_rug(token_address):
+                await execute_trade(token_address, buy=False, paper=paper)
+                profit = (current_price - buy_price) * current_buy_amount * 310
+                await send_notification(f"😾 Rug alert on {token_address}! Sold at ${current_price:.6f} for {profit:.1f}%! Saved our bag! 😿", is_win=profit > 0)
+                loss_streak = loss_streak + 1 if current_price < buy_price else 0
+                paper_trades.append({"token": token_address, "sell_price": current_price, "profit": profit, "timestamp": datetime.now().isoformat(), "type": "sell"})
+                break
+            if current_price <= active_positions[token_address]["trailing_stop"]:
+                await execute_trade(token_address, buy=False, paper=paper)
+                profit = (current_price - buy_price) * current_buy_amount * 310
+                await send_notification(f"💸 Trailing stop hit for {token_address} at ${current_price:.6f} for {profit:.1f}%! 💪", is_win=profit > 0)
+                loss_streak = loss_streak + 1 if current_price < buy_price else 0
+                paper_trades.append({"token": token_address, "sell_price": current_price, "profit": profit, "timestamp": datetime.now().isoformat(), "type": "sell"})
+                break
+            await asyncio.sleep(DATA_POLL_INTERVAL)
+    except Exception as e:
+        logging.error(f"Monitor price error for {token_address}: {str(e)}")
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Sends a welcome message to start the bot."""
     try:
-        await send_notification("💃 Dopamine Memecoin Sniper Bot v3.4 is LIVE! Ready to snipe Solana MOONSHOTS! 🌟😘", context)
+        await send_notification("💃 Dopamine Memecoin Sniper Bot v3.5 is LIVE! Ready to snipe Solana MOONSHOTS! 🌟😘", context)
     except Exception as e:
         logging.error(f"Error in /start command: {str(e)}")
+        await send_notification(f"😿 Error in /start command: {str(e)} 💔", context)
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Displays the list of available commands."""
     try:
         help_message = (
             "🧭 Dopamine Memecoin Sniper Bot Commands\n"
-            "/start — Welcome message\n"
-            "/help — Show this command list\n"
-            "/status — Show mode (live/paper) and API statuses\n"
-            "/mode — Show or switch mode (/mode live [PIN], /mode paper)\n"
-            "/preflight — Live-readiness checks (balance, APIs, RPC)\n"
-            "/wallet — Show public key and SOL balance\n"
-            "/backtest — Run Dex backtest snapshot\n"
-            "/portfolio — Show paper trading balance and positions\n"
-            "/trades — Show paper trade history CSV path\n"
-            "/autopaper on|off — Toggle auto paper trading\n"
-            "/export — Show latest CSV paths\n"
-            "/ping — Check if bot is alive"
+            "/start — Sends a welcome message\n"
+            "/help — Shows this command list\n"
+            "/status — Displays bot mode, API statuses, and trading info\n"
+            "/mode — Shows or switches mode (/mode live [PIN], /mode paper)\n"
+            "/preflight — Checks readiness for live trading (balance, APIs, RPC)\n"
+            "/wallet — Shows wallet public key and SOL balance\n"
+            "/backtest — Runs a backtest using DexScreener data\n"
+            "/portfolio — Shows paper trading balance and open positions\n"
+            "/trades — Saves and shows paper trade history CSV path\n"
+            "/autopaper on|off — Toggles auto paper trading\n"
+            "/export — Shows paths to backtest and trade CSVs\n"
+            "/ping — Checks if the bot is running"
         )
         await send_notification(help_message, context)
     except Exception as e:
         logging.error(f"Error in /help command: {str(e)}")
+        await send_notification(f"😿 Error in /help command: {str(e)} 💔", context)
 
 async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Shows bot mode, API statuses, wallet balance, and trading info."""
     try:
         async with AsyncClient(SOLANA_RPC) as sol_client:
             balance_ok, sol_balance = await check_wallet_balance(sol_client)
             balance_status = "✅ Sufficient" if balance_ok else "❌ Low"
             dex_token_status = "✅ OK" if session.get(f"{DEXSCREENER_TOKEN_API}").status_code == 200 else "❌ Failed"
             dex_pairs_status = "✅ OK" if session.get(f"{DEXSCREENER_PAIRS_API}/So11111111111111111111111111111111111111112").status_code == 200 else "❌ Failed"
-            shyft_status = "✅ OK" if session.get(f"{SHYFT_API}/So11111111111111111111111111111111111111112", headers={"x-api-key": SHYFT_API_KEY}).status_code == 200 else "❌ Failed"
+            shyft_status = "✅ OK" if SHYFT_API_KEY and session.get(f"{SHYFT_API}/So11111111111111111111111111111111111111112", headers={"x-api-key": SHYFT_API_KEY}).status_code == 200 else "❌ Failed"
             rpc_ok = True
             try:
                 await sol_client.get_latest_blockhash()
@@ -403,8 +437,10 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await send_notification(status_message, context)
     except Exception as e:
         logging.error(f"Error in /status command: {str(e)}")
+        await send_notification(f"😿 Error in /status command: {str(e)} 💔", context)
 
 async def mode_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Shows current mode or switches between live and paper trading."""
     try:
         global paper_trading
         args = context.args
@@ -412,23 +448,25 @@ async def mode_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             mode = "Paper" if paper_trading else "Live"
             await send_notification(f"Current mode: {mode}", context)
             return
-        if args[0] == "live" and len(args) == 2 and args[1] == MODE_PIN:
+        if args[0].lower() == "live" and len(args) == 2 and args[1] == MODE_PIN:
             paper_trading = False
             await send_notification("Switched to LIVE mode! 🚀 Ready to snipe real SOL! 😘", context)
-        elif args[0] == "paper":
+        elif args[0].lower() == "paper":
             paper_trading = True
             await send_notification("Switched to PAPER mode! 📝 Simulating trades safely! 😊", context)
         else:
             await send_notification("Invalid mode or PIN! Use /mode live [PIN] or /mode paper", context)
     except Exception as e:
         logging.error(f"Error in /mode command: {str(e)}")
+        await send_notification(f"😿 Error in /mode command: {str(e)} 💔", context)
 
 async def preflight_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Checks readiness for live trading (balance, APIs, RPC)."""
     try:
         async with AsyncClient(SOLANA_RPC) as sol_client:
             balance_ok, sol_balance = await check_wallet_balance(sol_client)
             dex_ok = session.get(f"{DEXSCREENER_PAIRS_API}/So11111111111111111111111111111111111111112").status_code == 200
-            shyft_ok = session.get(f"{SHYFT_API}/So11111111111111111111111111111111111111112", headers={"x-api-key": SHYFT_API_KEY}).status_code == 200
+            shyft_ok = SHYFT_API_KEY and session.get(f"{SHYFT_API}/So11111111111111111111111111111111111111112", headers={"x-api-key": SHYFT_API_KEY}).status_code == 200
             rpc_ok = True
             try:
                 await sol_client.get_latest_blockhash()
@@ -445,8 +483,10 @@ async def preflight_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await send_notification(message, context)
     except Exception as e:
         logging.error(f"Error in /preflight command: {str(e)}")
+        await send_notification(f"😿 Error in /preflight command: {str(e)} 💔", context)
 
 async def wallet_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Shows wallet public key and SOL balance."""
     try:
         async with AsyncClient(SOLANA_RPC) as sol_client:
             keypair = Keypair.from_base58_string(WALLET_PRIVATE_KEY)
@@ -459,8 +499,10 @@ async def wallet_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await send_notification(message, context)
     except Exception as e:
         logging.error(f"Error in /wallet command: {str(e)}")
+        await send_notification(f"😿 Error in /wallet command: {str(e)} 💔", context)
 
 async def backtest_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Runs a backtest using DexScreener data and saves results to CSV."""
     try:
         global paper_trades, current_buy_amount
         paper_trades = []
@@ -512,8 +554,10 @@ async def backtest_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await send_notification(f"😿 Failed to save backtest results! {str(e)} 💔", context)
     except Exception as e:
         logging.error(f"Error in /backtest command: {str(e)}")
+        await send_notification(f"😿 Error in /backtest command: {str(e)} 💔", context)
 
 async def portfolio_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Shows paper trading balance and open positions."""
     try:
         paper_balance = BUY_AMOUNT_MIN * 310
         for trade in paper_trades:
@@ -528,8 +572,10 @@ async def portfolio_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await send_notification(message, context)
     except Exception as e:
         logging.error(f"Error in /portfolio command: {str(e)}")
+        await send_notification(f"😿 Error in /portfolio command: {str(e)} 💔", context)
 
 async def trades_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Saves and shows paper trade history CSV path."""
     try:
         csv_path = "/opt/render/project/src/data/paper_trades.csv"
         with open(csv_path, "w", newline="") as f:
@@ -540,6 +586,7 @@ async def trades_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await send_notification(f"😿 Failed to save trade history! {str(e)} 💔", context)
 
 async def autopaper_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Toggles auto paper trading."""
     try:
         global auto_paper
         args = context.args
@@ -556,8 +603,10 @@ async def autopaper_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await send_notification("Use /autopaper on or /autopaper off", context)
     except Exception as e:
         logging.error(f"Error in /autopaper command: {str(e)}")
+        await send_notification(f"😿 Error in /autopaper command: {str(e)} 💔", context)
 
 async def export_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Shows paths to backtest and trade CSVs."""
     try:
         backtest_path = "/opt/render/project/src/data/backtest_results.csv"
         trades_path = "/opt/render/project/src/data/paper_trades.csv"
@@ -569,15 +618,19 @@ async def export_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await send_notification(message, context)
     except Exception as e:
         logging.error(f"Error in /export command: {str(e)}")
+        await send_notification(f"😿 Error in /export command: {str(e)} 💔", context)
 
 async def ping_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Checks if the bot is running."""
     try:
         await send_notification("🏓 Bot is alive and sniping! 😘", context)
     except Exception as e:
         logging.error(f"Error in /ping command: {str(e)}")
+        await send_notification(f"😿 Error in /ping command: {str(e)} 💔", context)
 
 async def start_telegram_bot():
-    if not TELEGRAM_BOT_TOKEN:
+    """Initializes and starts the Telegram bot with all commands."""
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         logging.error("Telegram bot token or chat ID missing")
         return
     try:
@@ -597,18 +650,19 @@ async def start_telegram_bot():
         await application.initialize()
         await application.start()
         await application.updater.start_polling()
-        logging.info("Telegram bot started")
+        logging.info("Telegram bot started successfully")
+        await send_notification("💃 Telegram bot started! Ready to accept commands! 😘")
     except Exception as e:
         logging.error(f"Failed to start Telegram bot: {str(e)}")
         await send_notification(f"😿 Telegram bot failed to start! {str(e)} 💔")
 
 async def health_check():
-    while True:
-        try:
+    try:
+        while True:
             await send_notification("💖 Dopamine Sniper Bot is running and scanning for MOONSHOTS! 😘")
-        except Exception as e:
-            logging.error(f"Health check error: {str(e)}")
-        await asyncio.sleep(HEALTH_CHECK_INTERVAL)
+            await asyncio.sleep(HEALTH_CHECK_INTERVAL)
+    except Exception as e:
+        logging.error(f"Health check error: {str(e)}")
 
 async def handle_callback(request):
     try:
@@ -644,7 +698,7 @@ async def main():
     asyncio.create_task(start_telegram_bot())
     asyncio.create_task(health_check())
     asyncio.create_task(start_server())
-    await send_notification("💃 Dopamine Memecoin Sniper Bot v3.4 is LIVE! Scanning Solana for 1000x MOONSHOTS! 🌟😘")
+    await send_notification("💃 Dopamine Memecoin Sniper Bot v3.5 is LIVE! Scanning Solana for 1000x MOONSHOTS! 🌟😘")
     while True:
         if trade_count >= MAX_TRADES_PER_DAY and datetime.now().date() == last_trade_day:
             await asyncio.sleep(3600)
