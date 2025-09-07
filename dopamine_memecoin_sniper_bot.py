@@ -31,7 +31,7 @@ SHYFT_API = "https://api.shyft.to/sol/v1/token"
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 BACKTEST_MODE = os.getenv("BACKTEST_MODE", "False") == "True"
-MODE_PIN = "1234"  # Hardcoded PIN for /mode live
+MODE_PIN = "1234"  # PIN for /mode live
 ENTRY_MC_MIN = 75000  # $75k
 ENTRY_MC_MAX = 2000000  # $2M
 ENTRY_LP_MIN_USD = 30000  # $30k
@@ -74,6 +74,7 @@ paper_trading = False
 auto_paper = False
 
 async def send_notification(message, context=None, is_win=True):
+    """Sends a Telegram notification with rate limiting and retry logic."""
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         logging.error("Telegram bot token or chat ID missing")
         return
@@ -95,6 +96,7 @@ async def send_notification(message, context=None, is_win=True):
     logging.info(f"{datetime.now()}: {message}")
 
 async def check_wallet_balance(sol_client):
+    """Checks Solana wallet balance with retries."""
     try:
         keypair = Keypair.from_base58_string(WALLET_PRIVATE_KEY)
         for _ in range(3):
@@ -116,6 +118,7 @@ async def check_wallet_balance(sol_client):
         return False, 0
 
 async def check_rug(token_address):
+    """Checks for rug pull signals using Shyft API."""
     if not SHYFT_API_KEY:
         logging.error("Shyft API key missing")
         await send_notification("😿 Shyft API key missing! Cannot perform rug checks. 💔")
@@ -142,6 +145,7 @@ async def check_rug(token_address):
         return False
 
 async def calculate_atr(token_address, current_price):
+    """Calculates ATR for trailing stop with error handling."""
     try:
         if token_address not in price_history:
             price_history[token_address] = []
@@ -167,6 +171,7 @@ async def calculate_atr(token_address, current_price):
         return 0
 
 async def check_token(token_address):
+    """Validates token using DexScreener with new filters."""
     cache_key = f"{DEXSCREENER_PAIRS_API}/{token_address}"
     cached_data, cached_time = api_cache.get(cache_key, (None, 0))
     if cached_data and datetime.now().timestamp() - cached_time < 30:
@@ -233,6 +238,7 @@ async def check_token(token_address):
     return market_cap, price, liquidity
 
 async def execute_trade(token_address, buy=True, paper=False):
+    """Executes a buy or sell trade, live or paper, with Raydium."""
     try:
         global loss_streak, trade_count, active_positions, current_buy_amount, paper_trades
         if paper or paper_trading:
@@ -308,6 +314,7 @@ async def execute_trade(token_address, buy=True, paper=False):
         return False
 
 async def monitor_price(token_address, buy_price, market_cap, paper=False):
+    """Monitors token price and triggers sell on trailing stop or rug pull."""
     try:
         global loss_streak, paper_trades
         start_time = datetime.now()
@@ -379,7 +386,7 @@ async def monitor_price(token_address, buy_price, market_cap, paper=False):
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Sends a welcome message to start the bot."""
     try:
-        await send_notification("💃 Dopamine Memecoin Sniper Bot v3.5 is LIVE! Ready to snipe Solana MOONSHOTS! 🌟😘", context)
+        await send_notification("💃 Dopamine Memecoin Sniper Bot v3.6 is LIVE! Ready to snipe Solana MOONSHOTS! 🌟😘", context)
     except Exception as e:
         logging.error(f"Error in /start command: {str(e)}")
         await send_notification(f"😿 Error in /start command: {str(e)} 💔", context)
@@ -632,6 +639,7 @@ async def start_telegram_bot():
     """Initializes and starts the Telegram bot with all commands."""
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         logging.error("Telegram bot token or chat ID missing")
+        await send_notification("😿 Telegram bot token or chat ID missing! Cannot start bot. 💔")
         return
     try:
         application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
@@ -657,6 +665,7 @@ async def start_telegram_bot():
         await send_notification(f"😿 Telegram bot failed to start! {str(e)} 💔")
 
 async def health_check():
+    """Periodically sends health check notifications."""
     try:
         while True:
             await send_notification("💖 Dopamine Sniper Bot is running and scanning for MOONSHOTS! 😘")
@@ -665,6 +674,7 @@ async def health_check():
         logging.error(f"Health check error: {str(e)}")
 
 async def handle_callback(request):
+    """Handles Shyft API callbacks."""
     try:
         data = await request.json()
         logging.info(f"Shyft callback received: {data}")
@@ -674,10 +684,12 @@ async def handle_callback(request):
         return web.Response(text="Error", status=500)
 
 async def handle_health(request):
+    """Handles health check requests for Render."""
     logging.info(f"Health check received at {datetime.now()}")
     return web.Response(text="Dopamine Memecoin Sniper Bot is running")
 
 async def start_server():
+    """Starts the HTTP server for Render health checks."""
     try:
         app = web.Application()
         app.add_routes([web.get("/", handle_health), web.post("/callback", handle_callback)])
@@ -691,6 +703,7 @@ async def start_server():
         await send_notification(f"😿 HTTP server failed to start! {str(e)} 💔")
 
 async def main():
+    """Main bot loop for scanning and trading Solana tokens."""
     global trade_count, last_trade_day, processed_tokens, paper_trading
     if BACKTEST_MODE:
         await backtest_command(None)
@@ -698,7 +711,7 @@ async def main():
     asyncio.create_task(start_telegram_bot())
     asyncio.create_task(health_check())
     asyncio.create_task(start_server())
-    await send_notification("💃 Dopamine Memecoin Sniper Bot v3.5 is LIVE! Scanning Solana for 1000x MOONSHOTS! 🌟😘")
+    await send_notification("💃 Dopamine Memecoin Sniper Bot v3.6 is LIVE! Scanning Solana for 1000x MOONSHOTS! 🌟😘")
     while True:
         if trade_count >= MAX_TRADES_PER_DAY and datetime.now().date() == last_trade_day:
             await asyncio.sleep(3600)
