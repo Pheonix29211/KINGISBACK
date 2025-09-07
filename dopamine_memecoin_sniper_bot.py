@@ -126,8 +126,11 @@ async def check_wallet_balance(sol_client):
         await send_notification(f"😿 Wallet balance check error: {str(e)} 💔")
         return False, 0
 
-async def check_rug(token_address):
-    """Checks for rug pull signals using Shyft API."""
+async def check_rug(token_address, is_backtest=False):
+    """Checks for rug pull signals using Shyft API, optional for backtest."""
+    if is_backtest and not SHYFT_API_KEY:
+        logging.warning("Shyft API key missing for backtest, skipping rug check")
+        return False
     if not SHYFT_API_KEY:
         logging.error("Shyft API key missing")
         await send_notification("😿 Shyft API key missing! Cannot perform rug checks. 💔")
@@ -184,7 +187,7 @@ async def calculate_atr(token_address, current_price):
         logging.error(f"ATR calculation error for {token_address}: {str(e)}")
         return 0
 
-async def check_token(token_address):
+async def check_token(token_address, is_backtest=False):
     """Validates token using DexScreener with new filters."""
     cache_key = f"{DEXSCREENER_PAIRS_API}/{token_address}"
     cached_data, cached_time = api_cache.get(cache_key, (None, 0))
@@ -215,15 +218,16 @@ async def check_token(token_address):
             logging.error(f"Token check failed for {token_address}: No valid response data after retries")
             return None, None, None
     try:
-        market_cap = float(data.get("pair", {}).get("marketCap", 0))
-        liquidity = float(data.get("pair", {}).get("liquidity", {}).get("usd", 0))
-        price = float(data.get("pair", {}).get("priceUsd", 0))
-        price_impact = float(data.get("pair", {}).get("priceChange", {}).get("m5", 0))
-        created_at = data.get("pair", {}).get("createdAt", None)
-        volume_1h = float(data.get("pair", {}).get("volume", {}).get("h1", 0))
-        price_change_1h = float(data.get("pair", {}).get("priceChange", {}).get("h1", 0))
+        pair = data.get("pair", {})
+        market_cap = float(pair.get("marketCap", 0))
+        liquidity = float(pair.get("liquidity", {}).get("usd", 0))
+        price = float(pair.get("priceUsd", 0))
+        price_impact = float(pair.get("priceChange", {}).get("m5", 0))
+        created_at = pair.get("createdAt", None)
+        volume_1h = float(pair.get("volume", {}).get("h1", 0))
+        price_change_1h = float(pair.get("priceChange", {}).get("h1", 0))
         acceleration = price_change_1h / 60 if price_change_1h > 0 else 0
-    except (ValueError, TypeError) as e:
+    except (ValueError, TypeError, KeyError) as e:
         logging.error(f"Data parsing error for {token_address}: {str(e)}")
         return None, None, None
     max_cap = ENTRY_MC_MAX / (2 if loss_streak >= LOSS_STREAK_THRESHOLD else 1)
@@ -241,10 +245,10 @@ async def check_token(token_address):
                 return None, None, None
         except (TypeError, ValueError):
             logging.warning(f"Invalid created_at for {token_address}, skipping age check")
-    if await check_rug(token_address):
+    if not is_backtest and await check_rug(token_address, is_backtest):
         logging.info(f"Token {token_address} filtered out: Rug detected")
         return None, None, None
-    price_volatility = float(data.get("pair", {}).get("priceChange", {}).get("m5", 0))
+    price_volatility = float(pair.get("priceChange", {}).get("m5", 0))
     if abs(price_volatility) > 15:
         logging.info(f"Token {token_address} filtered out: High volatility")
         return None, None, None
@@ -258,15 +262,15 @@ async def execute_trade(token_address, buy=True, paper=False):
         if paper or paper_trading:
             logging.info(f"Paper trade: {'Buying' if buy else 'Selling'} {token_address} with {current_buy_amount} SOL")
             if buy:
-                market_cap, buy_price, _ = await check_token(token_address)
+                market_cap, buy_price, _ = await check_token(token_address, is_backtest=paper)
                 if not market_cap:
                     return False
                 atr = await calculate_atr(token_address, buy_price)
                 active_positions[token_address] = {"buy_price": buy_price, "gain": 1.0, "atr": atr, "trailing_stop": buy_price - atr * ATR_MULTIPLIER}
-                paper_trades.append({"token": token_address, "buy_price": buy_price, "amount": current_buy_amount, "timestamp": datetime.now().isoformat(), "type": "buy"})
+                paper_trades.append({"token": token_address, "buy_price": buy_price, "amount": current_buy_amount, "timestamp": datetime.now().isoformat(), "trade_type": "buy"})
             else:
                 profit = (active_positions[token_address]["gain"] - 1) * current_buy_amount * 310
-                paper_trades.append({"token": token_address, "sell_price": active_positions[token_address]["buy_price"] * active_positions[token_address]["gain"], "profit": profit, "timestamp": datetime.now().isoformat(), "type": "sell"})
+                paper_trades.append({"token": token_address, "sell_price": active_positions[token_address]["buy_price"] * active_positions[token_address]["gain"], "profit": profit, "timestamp": datetime.now().isoformat(), "trade_type": "sell"})
                 if profit > 0:
                     current_buy_amount = min(BUY_AMOUNT_MAX * 2, current_buy_amount + profit * PROFIT_REINVEST_RATIO / 310)
                 active_positions.pop(token_address, None)
@@ -361,19 +365,19 @@ async def monitor_price(token_address, buy_price, market_cap, paper=False):
             active_positions[token_address]["atr"] = atr
             active_positions[token_address]["trailing_stop"] = current_price - atr * ATR_MULTIPLIER
             active_positions[token_address]["gain"] = current_price / buy_price
-            if not paper and await check_rug(token_address):
+            if not paper and await check_rug(token_address, is_backtest=paper):
                 await execute_trade(token_address, buy=False, paper=paper)
                 profit = (current_price - buy_price) * current_buy_amount * 310
                 await send_notification(f"😾 Rug alert on {token_address}! Sold at ${current_price:.6f} for {profit:.1f}%! Saved our bag! 😿", is_win=profit > 0)
                 loss_streak = loss_streak + 1 if current_price < buy_price else 0
-                paper_trades.append({"token": token_address, "sell_price": current_price, "profit": profit, "timestamp": datetime.now().isoformat(), "type": "sell"})
+                paper_trades.append({"token": token_address, "sell_price": current_price, "profit": profit, "timestamp": datetime.now().isoformat(), "trade_type": "sell"})
                 break
             if current_price <= active_positions[token_address]["trailing_stop"]:
                 await execute_trade(token_address, buy=False, paper=paper)
                 profit = (current_price - buy_price) * current_buy_amount * 310
                 await send_notification(f"💸 Trailing stop hit for {token_address} at ${current_price:.6f} for {profit:.1f}%! 💪", is_win=profit > 0)
                 loss_streak = loss_streak + 1 if current_price < buy_price else 0
-                paper_trades.append({"token": token_address, "sell_price": current_price, "profit": profit, "timestamp": datetime.now().isoformat(), "type": "sell"})
+                paper_trades.append({"token": token_address, "sell_price": current_price, "profit": profit, "timestamp": datetime.now().isoformat(), "trade_type": "sell"})
                 break
             await asyncio.sleep(DATA_POLL_INTERVAL)
     except Exception as e:
@@ -382,7 +386,7 @@ async def monitor_price(token_address, buy_price, market_cap, paper=False):
 async def start_command(chat_id):
     """Sends a welcome message to start the bot."""
     try:
-        await send_notification("💃 Dopamine Memecoin Sniper Bot v3.9 is LIVE! Ready to snipe Solana MOONSHOTS! 🌟😘", chat_id)
+        await send_notification("💃 Dopamine Memecoin Sniper Bot v3.10 is LIVE! Ready to snipe Solana MOONSHOTS! 🌟😘", chat_id)
     except Exception as e:
         logging.error(f"Error in /start command: {str(e)}")
         await send_notification(f"😿 Error in /start command: {str(e)} 💔", chat_id)
@@ -550,18 +554,19 @@ async def backtest_command(chat_id):
             await send_notification("😿 No Solana tokens found for backtest! Try again later. 💔", chat_id)
             return
         for token in tokens[:10]:  # Limit to 10 tokens
-            if len([t for t in paper_trades if t["type"] == "sell" and t["profit"] > 0]) >= MAX_TRADES_PER_DAY and datetime.now().date() == last_trade_day:
+            if len([t for t in paper_trades if t["trade_type"] == "sell" and t["profit"] > 0]) >= MAX_TRADES_PER_DAY and datetime.now().date() == last_trade_day:
                 break
-            market_cap, buy_price, liquidity = await check_token(token["tokenAddress"])
+            market_cap, buy_price, liquidity = await check_token(token["tokenAddress"], is_backtest=True)
             if market_cap:
                 await execute_trade(token["tokenAddress"], buy=True, paper=True)
                 await monitor_price(token["tokenAddress"], buy_price, market_cap, paper=True)
         df = pd.DataFrame(paper_trades)
-        win_rate = len(df[(df["type"] == "sell") & (df["profit"] > 0)]) / len(df[df["type"] == "sell"]) * 100 if len(df[df["type"] == "sell"]) > 0 else 0
-        avg_profit = df[df["type"] == "sell"]["profit"].mean() if len(df[df["type"] == "sell"]) > 0 else 0
-        total_profit = df[df["type"] == "sell"]["profit"].sum() if len(df[df["type"] == "sell"]) > 0 else 0
+        win_rate = len(df[(df["trade_type"] == "sell") & (df["profit"] > 0)]) / len(df[df["trade_type"] == "sell"]) * 100 if len(df[df["trade_type"] == "sell"]) > 0 else 0
+        avg_profit = df[df["trade_type"] == "sell"]["profit"].mean() if len(df[df["trade_type"] == "sell"]) > 0 else 0
+        total_profit = df[df["trade_type"] == "sell"]["profit"].sum() if len(df[df["trade_type"] == "sell"]) > 0 else 0
         csv_path = "/opt/render/project/src/data/backtest_results.csv"
         try:
+            os.makedirs(os.path.dirname(csv_path), exist_ok=True)
             with open(csv_path, "w", newline="") as f:
                 df.to_csv(f, index=False)
             result = (
@@ -584,7 +589,7 @@ async def portfolio_command(chat_id):
     try:
         paper_balance = BUY_AMOUNT_MIN * 310
         for trade in paper_trades:
-            if trade["type"] == "sell":
+            if trade["trade_type"] == "sell":
                 paper_balance += trade["profit"]
         positions = "\n".join([f"{token}: ${pos['buy_price']:.6f} (Gain: {pos['gain']:.2f}x, Trailing Stop: ${pos['trailing_stop']:.6f})" for token, pos in active_positions.items()])
         message = (
@@ -601,6 +606,7 @@ async def trades_command(chat_id):
     """Saves and shows paper trade history CSV path."""
     try:
         csv_path = "/opt/render/project/src/data/paper_trades.csv"
+        os.makedirs(os.path.dirname(csv_path), exist_ok=True)
         with open(csv_path, "w", newline="") as f:
             pd.DataFrame(paper_trades).to_csv(f, index=False)
         await send_notification(f"📜 Paper Trade History\nSaved to {csv_path}", chat_id)
@@ -763,7 +769,7 @@ async def main():
     asyncio.create_task(handle_telegram_updates())
     asyncio.create_task(health_check())
     asyncio.create_task(start_server())
-    await send_notification("💃 Dopamine Memecoin Sniper Bot v3.9 is LIVE! Scanning Solana for 1000x MOONSHOTS! 🌟😘")
+    await send_notification("💃 Dopamine Memecoin Sniper Bot v3.10 is LIVE! Scanning Solana for 1000x MOONSHOTS! 🌟😘")
     while True:
         if trade_count >= MAX_TRADES_PER_DAY and datetime.now().date() == last_trade_day:
             await asyncio.sleep(3600)
