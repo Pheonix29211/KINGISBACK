@@ -3,7 +3,6 @@ import requests
 from solana.rpc.async_api import AsyncClient
 from solders.keypair import Keypair
 from solana.transaction import Transaction
-from spl.token.instructions import create_associated_token_account, get_associated_token_address
 from aiohttp import web
 import json
 import os
@@ -218,16 +217,15 @@ async def check_token(token_address, is_backtest=False):
             logging.error(f"Token check failed for {token_address}: No valid response data after retries")
             return None, None, None
     try:
-        pair = data.get("pair", {})
-        market_cap = float(pair.get("marketCap", 0))
-        liquidity = float(pair.get("liquidity", {}).get("usd", 0))
-        price = float(pair.get("priceUsd", 0))
-        price_impact = float(pair.get("priceChange", {}).get("m5", 0))
-        created_at = pair.get("createdAt", None)
-        volume_1h = float(pair.get("volume", {}).get("h1", 0))
-        price_change_1h = float(pair.get("priceChange", {}).get("h1", 0))
+        market_cap = float(data.get("pair", {}).get("marketCap", 0))
+        liquidity = float(data.get("pair", {}).get("liquidity", {}).get("usd", 0))
+        price = float(data.get("pair", {}).get("priceUsd", 0))
+        price_impact = float(data.get("pair", {}).get("priceChange", {}).get("m5", 0))
+        created_at = data.get("pair", {}).get("createdAt", None)
+        volume_1h = float(data.get("pair", {}).get("volume", {}).get("h1", 0))
+        price_change_1h = float(data.get("pair", {}).get("priceChange", {}).get("h1", 0))
         acceleration = price_change_1h / 60 if price_change_1h > 0 else 0
-    except (ValueError, TypeError, KeyError) as e:
+    except (ValueError, TypeError) as e:
         logging.error(f"Data parsing error for {token_address}: {str(e)}")
         return None, None, None
     max_cap = ENTRY_MC_MAX / (2 if loss_streak >= LOSS_STREAK_THRESHOLD else 1)
@@ -245,10 +243,10 @@ async def check_token(token_address, is_backtest=False):
                 return None, None, None
         except (TypeError, ValueError):
             logging.warning(f"Invalid created_at for {token_address}, skipping age check")
-    if not is_backtest and await check_rug(token_address, is_backtest):
+    if await check_rug(token_address, is_backtest=True):
         logging.info(f"Token {token_address} filtered out: Rug detected")
         return None, None, None
-    price_volatility = float(pair.get("priceChange", {}).get("m5", 0))
+    price_volatility = float(data.get("pair", {}).get("priceChange", {}).get("m5", 0))
     if abs(price_volatility) > 15:
         logging.info(f"Token {token_address} filtered out: High volatility")
         return None, None, None
@@ -386,7 +384,7 @@ async def monitor_price(token_address, buy_price, market_cap, paper=False):
 async def start_command(chat_id):
     """Sends a welcome message to start the bot."""
     try:
-        await send_notification("💃 Dopamine Memecoin Sniper Bot v3.10 is LIVE! Ready to snipe Solana MOONSHOTS! 🌟😘", chat_id)
+        await send_notification("💃 Dopamine Memecoin Sniper Bot v3.11 is LIVE! Ready to snipe Solana MOONSHOTS! 🌟😘", chat_id)
     except Exception as e:
         logging.error(f"Error in /start command: {str(e)}")
         await send_notification(f"😿 Error in /start command: {str(e)} 💔", chat_id)
@@ -553,17 +551,28 @@ async def backtest_command(chat_id):
             logging.warning("No Solana tokens found, skipping backtest")
             await send_notification("😿 No Solana tokens found for backtest! Try again later. 💔", chat_id)
             return
-        for token in tokens[:10]:  # Limit to 10 tokens
+        tokens_processed = 0
+        for token in tokens[:20]:  # Increased to 20 for better chances of trades
             if len([t for t in paper_trades if t["trade_type"] == "sell" and t["profit"] > 0]) >= MAX_TRADES_PER_DAY and datetime.now().date() == last_trade_day:
                 break
             market_cap, buy_price, liquidity = await check_token(token["tokenAddress"], is_backtest=True)
             if market_cap:
                 await execute_trade(token["tokenAddress"], buy=True, paper=True)
                 await monitor_price(token["tokenAddress"], buy_price, market_cap, paper=True)
+                tokens_processed += 1
+        if tokens_processed == 0:
+            logging.warning("No tokens passed filters during backtest")
+            await send_notification("😿 No tokens passed filters during backtest! Check filters or try again later. 💔", chat_id)
+            return
         df = pd.DataFrame(paper_trades)
-        win_rate = len(df[(df["trade_type"] == "sell") & (df["profit"] > 0)]) / len(df[df["trade_type"] == "sell"]) * 100 if len(df[df["trade_type"] == "sell"]) > 0 else 0
-        avg_profit = df[df["trade_type"] == "sell"]["profit"].mean() if len(df[df["trade_type"] == "sell"]) > 0 else 0
-        total_profit = df[df["trade_type"] == "sell"]["profit"].sum() if len(df[df["trade_type"] == "sell"]) > 0 else 0
+        if df.empty or 'trade_type' not in df.columns:
+            logging.warning("No trades executed during backtest")
+            await send_notification("😿 No trades executed during backtest! No results available. 💔", chat_id)
+            return
+        sell_df = df[df["trade_type"] == "sell"]
+        win_rate = len(sell_df[sell_df["profit"] > 0]) / len(sell_df) * 100 if not sell_df.empty else 0
+        avg_profit = sell_df["profit"].mean() if not sell_df.empty else 0
+        total_profit = sell_df["profit"].sum() if not sell_df.empty else 0
         csv_path = "/opt/render/project/src/data/backtest_results.csv"
         try:
             os.makedirs(os.path.dirname(csv_path), exist_ok=True)
@@ -769,7 +778,7 @@ async def main():
     asyncio.create_task(handle_telegram_updates())
     asyncio.create_task(health_check())
     asyncio.create_task(start_server())
-    await send_notification("💃 Dopamine Memecoin Sniper Bot v3.10 is LIVE! Scanning Solana for 1000x MOONSHOTS! 🌟😘")
+    await send_notification("💃 Dopamine Memecoin Sniper Bot v3.11 is LIVE! Scanning Solana for 1000x MOONSHOTS! 🌟😘")
     while True:
         if trade_count >= MAX_TRADES_PER_DAY and datetime.now().date() == last_trade_day:
             await asyncio.sleep(3600)
