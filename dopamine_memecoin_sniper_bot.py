@@ -30,6 +30,7 @@ DEXSCREENER_PAIRS_API = "https://api.dexscreener.com/latest/dex/pairs/solana"
 SHYFT_API = "https://api.shyft.to/sol/v1/token"
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+BACKTEST_MODE = os.getenv("BACKTEST_MODE", "False") == "True"
 MODE_PIN = "1234"  # Hardcoded PIN for /mode live
 ENTRY_MC_MIN = 75000  # $75k
 ENTRY_MC_MAX = 2000000  # $2M
@@ -348,7 +349,7 @@ async def monitor_price(token_address, buy_price, market_cap, paper=False):
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
-        await send_notification("💃 Dopamine Memecoin Sniper Bot v3.3 is LIVE! Ready to snipe Solana MOONSHOTS! 🌟😘", context)
+        await send_notification("💃 Dopamine Memecoin Sniper Bot v3.4 is LIVE! Ready to snipe Solana MOONSHOTS! 🌟😘", context)
     except Exception as e:
         logging.error(f"Error in /start command: {str(e)}")
 
@@ -643,7 +644,7 @@ async def main():
     asyncio.create_task(start_telegram_bot())
     asyncio.create_task(health_check())
     asyncio.create_task(start_server())
-    await send_notification("💃 Dopamine Memecoin Sniper Bot v3.3 is LIVE! Scanning Solana for 1000x MOONSHOTS! 🌟😘")
+    await send_notification("💃 Dopamine Memecoin Sniper Bot v3.4 is LIVE! Scanning Solana for 1000x MOONSHOTS! 🌟😘")
     while True:
         if trade_count >= MAX_TRADES_PER_DAY and datetime.now().date() == last_trade_day:
             await asyncio.sleep(3600)
